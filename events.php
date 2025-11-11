@@ -1,6 +1,6 @@
 <?php
 session_start();
-if (!isset($_SESSION['username']) || !in_array($_SESSION['usertype'], ['Governor', 'Vice Governor'])) {
+if (!isset($_SESSION['username']) || !in_array($_SESSION['usertype'], ['Secretary', 'Treasurer', 'Auditor', 'Social Manager', 'Senator', 'Governor', 'Vice Governor'])) {
     header("Location: ../login.php");
     exit();
 }
@@ -15,11 +15,25 @@ function sanitize($data) {
     return htmlspecialchars(trim($data), ENT_QUOTES, 'UTF-8');
 }
 
+// Year Level Display Mapping
+function formatYearLevel($yearLevel) {
+    $mapping = [
+        '1stYearLevel' => '1st Year',
+        '2ndYearLevel' => '2nd Year',
+        '3rdYearLevel' => '3rd Year',
+        '4thYearLevel' => '4th Year',
+        'AllLevels' => 'All Levels'
+    ];
+    return $mapping[$yearLevel] ?? $yearLevel;
+}
+
 // ===== CREATE EVENT =====
 if (isset($_POST['create_event'])) {
     $event_Name = sanitize($_POST['event_Name']);
     $event_Date = sanitize($_POST['event_Date']);
     $location   = sanitize($_POST['location']);
+    $time_session = sanitize($_POST['time_session']);
+    $year_level = sanitize($_POST['year_level']);
     
     $conn->begin_transaction();
     
@@ -34,8 +48,8 @@ if (isset($_POST['create_event'])) {
             throw new Exception("Event name already exists!");
         }
         
-        $stmt = $conn->prepare("INSERT INTO event (event_Name, event_Date, location) VALUES (?, ?, ?)");
-        $stmt->bind_param("sss", $event_Name, $event_Date, $location);
+        $stmt = $conn->prepare("INSERT INTO event (event_Name, event_Date, location, Time_Session, YearLevel) VALUES (?, ?, ?, ?, ?)");
+        $stmt->bind_param("sssss", $event_Name, $event_Date, $location, $time_session, $year_level);
         $stmt->execute();
         $stmt->close();
         $check->close();
@@ -77,6 +91,8 @@ if (isset($_POST['update_event'])) {
     $event_Name = sanitize($_POST['event_Name']);
     $event_Date = sanitize($_POST['event_Date']);
     $location   = sanitize($_POST['location']);
+    $time_session = sanitize($_POST['time_session']);
+    $year_level = sanitize($_POST['year_level']);
     
     $conn->begin_transaction();
     
@@ -93,8 +109,8 @@ if (isset($_POST['update_event'])) {
             $check->close();
         }
         
-        $stmt = $conn->prepare("UPDATE event SET event_Name=?, event_Date=?, location=? WHERE event_Name=?");
-        $stmt->bind_param("ssss", $event_Name, $event_Date, $location, $original_name);
+        $stmt = $conn->prepare("UPDATE event SET event_Name=?, event_Date=?, location=?, Time_Session=?, YearLevel=? WHERE event_Name=?");
+        $stmt->bind_param("ssssss", $event_Name, $event_Date, $location, $time_session, $year_level, $original_name);
         $stmt->execute();
         $stmt->close();
         
@@ -370,6 +386,24 @@ tbody tr:last-child td {
   border-bottom: none;
 }
 
+.badge {
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-block;
+}
+
+.badge-time {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.badge-year {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
 /* Action Buttons */
 .action-buttons {
   display: flex;
@@ -454,7 +488,7 @@ tbody tr:last-child td {
   font-size: 14px;
 }
 
-.form-control {
+.form-control, .form-select {
   padding: 12px;
   border: 2px solid #e2e8f0;
   border-radius: 8px;
@@ -462,7 +496,7 @@ tbody tr:last-child td {
   transition: all 0.3s;
 }
 
-.form-control:focus {
+.form-control:focus, .form-select:focus {
   border-color: #0ea5e9;
   box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.1);
 }
@@ -521,7 +555,7 @@ tbody tr:last-child td {
   }
   
   table {
-    min-width: 600px;
+    min-width: 800px;
   }
 }
 </style>
@@ -561,6 +595,8 @@ tbody tr:last-child td {
                     <th>Event Name</th>
                     <th>Event Date</th>
                     <th>Location</th>
+                    <th>Time Session</th>
+                    <th>Year Level</th>
                     <th>Actions</th>
                 </tr>
             </thead>
@@ -571,12 +607,16 @@ tbody tr:last-child td {
                     <td><strong><?= htmlspecialchars($row['event_Name']) ?></strong></td>
                     <td><?= date('M d, Y', strtotime($row['event_Date'])) ?></td>
                     <td><?= htmlspecialchars($row['location']) ?></td>
+                    <td><span class="badge badge-time"><?= htmlspecialchars($row['Time_Session']) ?></span></td>
+                    <td><span class="badge badge-year"><?= formatYearLevel($row['YearLevel']) ?></span></td>
                     <td>
                         <div class="action-buttons">
                             <button class="action-btn edit-btn" 
                                     data-name="<?= htmlspecialchars($row['event_Name']) ?>"
                                     data-date="<?= $row['event_Date'] ?>"
                                     data-location="<?= htmlspecialchars($row['location']) ?>"
+                                    data-time="<?= htmlspecialchars($row['Time_Session']) ?>"
+                                    data-year="<?= htmlspecialchars($row['YearLevel']) ?>"
                                     onclick="editEvent(this)"
                                     title="Edit">
                                 <i class="fa fa-pen"></i>
@@ -592,7 +632,7 @@ tbody tr:last-child td {
                 <?php endwhile; ?>
             <?php else: ?>
                 <tr>
-                    <td colspan="4">
+                    <td colspan="6">
                         <div class="empty-state">
                             <i class="fa fa-calendar-times"></i>
                             <p>No events found.</p>
@@ -626,6 +666,26 @@ tbody tr:last-child td {
           <div class="mb-3">
             <label class="form-label">Location <span style="color:#ef4444;">*</span></label>
             <input type="text" name="location" class="form-control" placeholder="Enter location" required>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Time Session <span style="color:#ef4444;">*</span></label>
+            <select name="time_session" class="form-select" required>
+              <option value="">Select Time Session</option>
+              <option value="AM Session">AM Session</option>
+              <option value="PM Session">PM Session</option>
+              <option value="Full Day">Full Day</option>
+            </select>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Year Level <span style="color:#ef4444;">*</span></label>
+            <select name="year_level" class="form-select" required>
+              <option value="">Select Year Level</option>
+              <option value="1stYearLevel">1st Year</option>
+              <option value="2ndYearLevel">2nd Year</option>
+              <option value="3rdYearLevel">3rd Year</option>
+              <option value="4thYearLevel">4th Year</option>
+              <option value="AllLevels">All Levels</option>
+            </select>
           </div>
         </div>
         <div class="modal-footer">
@@ -662,6 +722,26 @@ tbody tr:last-child td {
             <label class="form-label">Location <span style="color:#ef4444;">*</span></label>
             <input type="text" name="location" id="edit_location" class="form-control" required>
           </div>
+          <div class="mb-3">
+            <label class="form-label">Time Session <span style="color:#ef4444;">*</span></label>
+            <select name="time_session" id="edit_time_session" class="form-select" required>
+              <option value="">Select Time Session</option>
+              <option value="AM Session">AM Session</option>
+              <option value="PM Session">PM Session</option>
+              <option value="Full Day">Full Day</option>
+            </select>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Year Level <span style="color:#ef4444;">*</span></label>
+            <select name="year_level" id="edit_year_level" class="form-select" required>
+              <option value="">Select Year Level</option>
+              <option value="1stYearLevel">1st Year</option>
+              <option value="2ndYearLevel">2nd Year</option>
+              <option value="3rdYearLevel">3rd Year</option>
+              <option value="4thYearLevel">4th Year</option>
+              <option value="AllLevels">All Levels</option>
+            </select>
+          </div>
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
@@ -680,10 +760,14 @@ function editEvent(button) {
     const name = button.dataset.name;
     const date = button.dataset.date;
     const location = button.dataset.location;
+    const time = button.dataset.time;
+    const year = button.dataset.year;
     
     document.getElementById('edit_event_name').value = name;
     document.getElementById('edit_event_date').value = date;
     document.getElementById('edit_location').value = location;
+    document.getElementById('edit_time_session').value = time;
+    document.getElementById('edit_year_level').value = year;
     document.getElementById('original_name').value = name;
     
     new bootstrap.Modal(document.getElementById('editEventModal')).show();
@@ -709,3 +793,4 @@ function confirmDelete(name) {
 </script>
 </body>
 </html>
+<?php $conn->close(); ?>

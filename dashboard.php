@@ -10,15 +10,11 @@ $totalStudents = $conn->query("SELECT COUNT(*) FROM student_profile")->fetch_row
 $registrationCollected = $conn->query("SELECT IFNULL(SUM(amount),0) FROM registration WHERE payment_status='Paid'")->fetch_row()[0] ?? 0;
 $finesCollected = $conn->query("SELECT IFNULL(SUM(penalty_amount),0) FROM fines_payments WHERE payment_status='Paid'")->fetch_row()[0] ?? 0;
 $totalIncome = $registrationCollected + $finesCollected;
-$totalUsers = $conn->query("SELECT COUNT(*) FROM users")->fetch_row()[0] ?? 0;
 
-// Get pending payments
-$pendingPayments = $conn->query("SELECT COUNT(*) FROM registration WHERE payment_status='Unpaid' OR payment_status='Partial Paid'")->fetch_row()[0] ?? 0;
-
-$recent = $conn->query("SELECT sp.FirstName, sp.LastName, sp.Course, r.registration_date 
+$recent = $conn->query("SELECT sp.FirstName, sp.LastName, r.registration_date 
                         FROM registration r 
                         JOIN student_profile sp ON r.students_id = sp.students_id 
-                        ORDER BY r.registration_date DESC LIMIT 6");
+                        ORDER BY r.registration_date DESC LIMIT 5");
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -138,18 +134,6 @@ body {
     color: #7c3aed;
 }
 
-.stat-card.red::before { background: #ef4444; }
-.stat-card.red .stat-icon {
-    background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
-    color: #dc2626;
-}
-
-.stat-card.indigo::before { background: #6366f1; }
-.stat-card.indigo .stat-icon {
-    background: linear-gradient(135deg, #e0e7ff 0%, #c7d2fe 100%);
-    color: #4f46e5;
-}
-
 /* Bottom Section Layout */
 .bottom-grid {
     display: grid;
@@ -221,16 +205,6 @@ body {
 
 .recent-table tbody tr:last-child td {
     border-bottom: none;
-}
-
-.course-badge {
-    padding: 4px 10px;
-    border-radius: 6px;
-    font-weight: 600;
-    font-size: 11px;
-    background: #dbeafe;
-    color: #1e40af;
-    display: inline-block;
 }
 
 .empty-state {
@@ -372,8 +346,6 @@ body {
 .stat-card:nth-child(2) { animation-delay: 0.2s; }
 .stat-card:nth-child(3) { animation-delay: 0.3s; }
 .stat-card:nth-child(4) { animation-delay: 0.4s; }
-.stat-card:nth-child(5) { animation-delay: 0.5s; }
-.stat-card:nth-child(6) { animation-delay: 0.6s; }
 </style>
 </head>
 <body>
@@ -395,7 +367,7 @@ body {
                 <i class="fa-solid fa-file-invoice-dollar"></i>
             </div>
             <div class="stat-content">
-                <h3>Registration Fees</h3>
+                <h3>Registration Collected</h3>
                 <div class="stat-value">₱<?= number_format($registrationCollected, 2) ?></div>
             </div>
         </div>
@@ -419,26 +391,6 @@ body {
                 <div class="stat-value">₱<?= number_format($totalIncome, 2) ?></div>
             </div>
         </div>
-
-        <div class="stat-card red">
-            <div class="stat-icon">
-                <i class="fa-solid fa-clock"></i>
-            </div>
-            <div class="stat-content">
-                <h3>Pending Payments</h3>
-                <div class="stat-value"><?= number_format($pendingPayments) ?></div>
-            </div>
-        </div>
-
-        <div class="stat-card indigo">
-            <div class="stat-icon">
-                <i class="fa-solid fa-user-shield"></i>
-            </div>
-            <div class="stat-content">
-                <h3>System Users</h3>
-                <div class="stat-value"><?= number_format($totalUsers) ?></div>
-            </div>
-        </div>
     </div>
 
     <!-- Bottom Grid -->
@@ -452,8 +404,7 @@ body {
             <table class="recent-table">
                 <thead>
                     <tr>
-                        <th>Student Name</th>
-                        <th>Course</th>
+                        <th>Name</th>
                         <th>Date Registered</th>
                     </tr>
                 </thead>
@@ -462,13 +413,12 @@ body {
                         <?php while($r = $recent->fetch_assoc()): ?>
                             <tr>
                                 <td><strong><?= htmlspecialchars($r['FirstName'] . ' ' . $r['LastName']) ?></strong></td>
-                                <td><span class="course-badge"><?= htmlspecialchars($r['Course']) ?></span></td>
                                 <td><?= date('M d, Y', strtotime($r['registration_date'])) ?></td>
                             </tr>
                         <?php endwhile; ?>
                     <?php else: ?>
                         <tr>
-                            <td colspan="3">
+                            <td colspan="2">
                                 <div class="empty-state">
                                     <i class="fa-solid fa-inbox"></i>
                                     <p>No recent registrations found.</p>
