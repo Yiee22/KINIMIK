@@ -1,0 +1,1213 @@
+<?php
+session_start();
+if (!isset($_SESSION['username']) || !in_array($_SESSION['usertype'], ['Secretary', 'Treasurer', 'Auditor', 'Social Manager', 'Senator', 'Governor', 'Vice Governor'])) {
+    header("Location: ../login.php");
+    exit();
+}
+
+$conn = new mysqli("localhost", "root", "", "csso");
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+
+// Handle AJAX Service/Discount Processing
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'apply_service_discount') {
+    header('Content-Type: application/json');
+    
+    $students_id = $_POST['students_id'] ?? '';
+    $selected_fines = json_decode($_POST['selected_fines'] ?? '[]', true);
+    
+    if (empty($students_id) || empty($selected_fines)) {
+        echo json_encode(['success' => false, 'message' => 'Invalid service data']);
+        exit();
+    }
+    
+    $service_date = date('Y-m-d');
+    $conn->begin_transaction();
+    
+    try {
+        $insert_service_sql = "INSERT INTO comservice (fines_id, students_id, penalty_amount, total_hours, hours_completed, service_date, status, discount) 
+                               VALUES (?, ?, ?, 0, 0, ?, 'Ongoing', ?)";
+        
+        $update_fine_sql = "UPDATE fines SET PenaltyAmount = ? WHERE fines_id = ?";
+        
+        $insert_stmt = $conn->prepare($insert_service_sql);
+        $update_stmt = $conn->prepare($update_fine_sql);
+        
+        foreach ($selected_fines as $fine) {
+            $fines_id = intval($fine['fines_id']);
+            $penalty_amount = floatval($fine['penalty_amount']);
+            $discount_amount = floatval($fine['discount']);
+            
+            if ($discount_amount > $penalty_amount) {
+                throw new Exception("Discount cannot exceed penalty amount for fine ID: " . $fines_id);
+            }
+            
+            $new_penalty_amount = $penalty_amount - $discount_amount;
+            
+            $insert_stmt->bind_param("isdsd", $fines_id, $students_id, $penalty_amount, $service_date, $discount_amount);
+            
+            if (!$insert_stmt->execute()) {
+                throw new Exception("Failed to insert service record for fine ID: " . $fines_id);
+            }
+            
+            $update_stmt->bind_param("di", $new_penalty_amount, $fines_id);
+            
+            if (!$update_stmt->execute()) {
+                throw new Exception("Failed to update penalty amount for fine ID: " . $fines_id);
+            }
+        }
+        
+        $insert_stmt->close();
+        $update_stmt->close();
+        $conn->commit();
+        
+        echo json_encode([
+            'success' => true, 
+            'message' => 'Service discount applied successfully!',
+            'fines_processed' => count($selected_fines)
+        ]);
+        
+    } catch (Exception $e) {
+        $conn->rollback();
+        echo json_encode(['success' => false, 'message' => 'Transaction failed: ' . $e->getMessage()]);
+    }
+    
+    $conn->close();
+    exit();
+}
+
+// Handle AJAX Payment Processing
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'process_payment') {
+    header('Content-Type: application/json');
+    
+    $students_id = $_POST['students_id'] ?? '';
+    $selected_fines = json_decode($_POST['selected_fines'] ?? '[]', true);
+    $payment_amount = floatval($_POST['payment_amount'] ?? 0);
+    $payment_type = $_POST['payment_type'] ?? 'Cash';
+    $total_penalty = floatval($_POST['total_penalty'] ?? 0);
+    
+    if (empty($students_id) || empty($selected_fines) || $payment_amount <= 0) {
+        echo json_encode(['success' => false, 'message' => 'Invalid payment data']);
+        exit();
+    }
+    
+    if ($payment_amount > $total_penalty) {
+        echo json_encode(['success' => false, 'message' => 'Payment amount cannot exceed total penalty amount']);
+        exit();
+    }
+    
+    $balance = $total_penalty - $payment_amount;
+    
+    if ($balance <= 0) {
+        $payment_status = 'Paid';
+        $balance = 0;
+    } else {
+        $payment_status = 'Partial Paid';
+    }
+    
+    $payment_date = date('Y-m-d');
+    $conn->begin_transaction();
+    
+    try {
+        $insert_payment_sql = "INSERT INTO fines_payments (fines_id, students_id, payment_amount, penalty_amount, payment_type, balance, payment_status, payment_date) 
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        
+        $update_fine_sql = "UPDATE fines SET PenaltyAmount = ? WHERE fines_id = ?";
+        
+        $insert_stmt = $conn->prepare($insert_payment_sql);
+        $update_stmt = $conn->prepare($update_fine_sql);
+        
+        $remaining_payment = $payment_amount;
+        
+        foreach ($selected_fines as $index => $fine) {
+            $fines_id = intval($fine['fines_id']);
+            $penalty_amount = floatval($fine['penalty_amount']);
+            
+            if ($index === count($selected_fines) - 1) {
+                $individual_payment = $remaining_payment;
+            } else {
+                $individual_payment = ($penalty_amount / $total_penalty) * $payment_amount;
+                $remaining_payment -= $individual_payment;
+            }
+            
+            $individual_balance = $penalty_amount - $individual_payment;
+            
+            if ($individual_balance <= 0) {
+                $individual_status = 'Paid';
+                $individual_balance = 0;
+            } else {
+                $individual_status = 'Partial Paid';
+            }
+            
+            $insert_stmt->bind_param("isddsdss", $fines_id, $students_id, $individual_payment, $penalty_amount, $payment_type, $individual_balance, $individual_status, $payment_date);
+            
+            if (!$insert_stmt->execute()) {
+                throw new Exception("Failed to insert payment for fine ID: " . $fines_id);
+            }
+            
+            $new_penalty_amount = max(0, $individual_balance);
+            $update_stmt->bind_param("di", $new_penalty_amount, $fines_id);
+            
+            if (!$update_stmt->execute()) {
+                throw new Exception("Failed to update penalty amount for fine ID: " . $fines_id);
+            }
+        }
+        
+        $insert_stmt->close();
+        $update_stmt->close();
+        $conn->commit();
+        
+        echo json_encode([
+            'success' => true, 
+            'message' => 'Payment processed successfully!',
+            'payment_status' => $payment_status,
+            'balance' => number_format($balance, 2),
+            'fines_paid' => count($selected_fines)
+        ]);
+        
+    } catch (Exception $e) {
+        $conn->rollback();
+        echo json_encode(['success' => false, 'message' => 'Transaction failed: ' . $e->getMessage()]);
+    }
+    
+    $conn->close();
+    exit();
+}
+
+$search = $_GET['search'] ?? '';
+$course_filter = $_GET['course'] ?? 'BSIT';
+$year_filter = $_GET['year'] ?? '';
+$semester_filter = $_GET['semester'] ?? '';
+$school_year_filter = $_GET['school_year'] ?? '';
+
+$fines_where = "";
+
+if (!empty($school_year_filter) && !empty($semester_filter)) {
+    $fines_where = " AND r.school_year = '$school_year_filter' AND r.semester = '$semester_filter'";
+} elseif (!empty($school_year_filter)) {
+    $fines_where = " AND r.school_year = '$school_year_filter'";
+} elseif (!empty($semester_filter)) {
+    $fines_where = " AND r.semester = '$semester_filter'";
+}
+
+$sql = "SELECT 
+    sp.students_id,
+    CONCAT(sp.LastName, ', ', sp.FirstName) as FullName,
+    sp.Course,
+    sp.Section,
+    sp.YearLevel,
+    SUM(f.PenaltyAmount) as TotalPenalty,
+    COUNT(f.fines_id) as TotalFines,
+    GROUP_CONCAT(f.fines_id ORDER BY f.event_date DESC SEPARATOR ',') as FinesIds,
+    GROUP_CONCAT(f.PenaltyAmount ORDER BY f.event_date DESC SEPARATOR ',') as PenaltyAmounts,
+    GROUP_CONCAT(f.event_name ORDER BY f.event_date DESC SEPARATOR '|||') as EventNames
+FROM student_profile sp
+INNER JOIN fines f ON sp.students_id = f.students_id
+LEFT JOIN registration r ON f.registration_no = r.registration_no
+WHERE f.PenaltyAmount > 0 $fines_where";
+
+if (!empty($search)) {
+    $search_term = $conn->real_escape_string($search);
+    $sql .= " AND (sp.students_id LIKE '%$search_term%' 
+              OR sp.LastName LIKE '%$search_term%' 
+              OR sp.FirstName LIKE '%$search_term%')";
+}
+
+if (!empty($course_filter)) {
+    $course_term = $conn->real_escape_string($course_filter);
+    $sql .= " AND sp.Course = '$course_term'";
+}
+
+if (!empty($year_filter)) {
+    $year_term = $conn->real_escape_string($year_filter);
+    $sql .= " AND sp.YearLevel = '$year_term'";
+}
+
+$sql .= " GROUP BY sp.students_id, sp.LastName, sp.FirstName, sp.Course, sp.Section, sp.YearLevel
+          HAVING TotalPenalty > 0
+          ORDER BY sp.LastName ASC, sp.FirstName ASC";
+
+$result = $conn->query($sql);
+
+$courses_sql = "SELECT DISTINCT Course FROM student_profile WHERE Course IS NOT NULL ORDER BY Course";
+$courses_result = $conn->query($courses_sql);
+
+$stats_sql = "SELECT 
+    COUNT(DISTINCT sp.students_id) as total_students,
+    SUM(f.PenaltyAmount) as total_amount,
+    COUNT(f.fines_id) as total_records
+FROM student_profile sp
+INNER JOIN fines f ON sp.students_id = f.students_id
+LEFT JOIN registration r ON f.registration_no = r.registration_no
+WHERE f.PenaltyAmount > 0 $fines_where";
+
+if (!empty($search)) {
+    $search_term = $conn->real_escape_string($search);
+    $stats_sql .= " AND (sp.students_id LIKE '%$search_term%' 
+                   OR sp.LastName LIKE '%$search_term%' 
+                   OR sp.FirstName LIKE '%$search_term%')";
+}
+
+if (!empty($course_filter)) {
+    $course_term = $conn->real_escape_string($course_filter);
+    $stats_sql .= " AND sp.Course = '$course_term'";
+}
+
+if (!empty($year_filter)) {
+    $year_term = $conn->real_escape_string($year_filter);
+    $stats_sql .= " AND sp.YearLevel = '$year_term'";
+}
+
+$stats = $conn->query($stats_sql)->fetch_assoc();
+
+function getCourseName($course) {
+    $courseNames = [
+        'BSIT' => 'Bachelor of Science in Information Technology',
+        'BSCS' => 'Bachelor of Science in Computer Science',
+        'BSA' => 'Bachelor of Science in Accountancy',
+        'BSBA' => 'Bachelor of Science in Business Administration'
+    ];
+    return $courseNames[$course] ?? $course;
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fines Records | CSSO</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+<style>
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #f0f4f8;
+  color: #1e3a5f;
+  padding: 0;
+}
+.container {
+  padding: 24px;
+  max-width: 1600px;
+  margin: 0 auto;
+}
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 3px solid #fef3c7;
+}
+.page-header i {
+  background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+  color: white;
+  padding: 14px;
+  border-radius: 12px;
+  font-size: 22px;
+  box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
+}
+.page-header h2 {
+  font-size: 26px;
+  font-weight: 600;
+  color: #1e3a5f;
+  letter-spacing: -0.3px;
+}
+.stat-card {
+  background: white;
+  padding: 20px;
+  border-radius: 12px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+  border-left: 4px solid #f59e0b;
+}
+.stat-card h4 {
+  font-size: 13px;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+.stat-card p {
+  font-size: 24px;
+  font-weight: 700;
+  color: #f59e0b;
+}
+.controls {
+  background: white;
+  padding: 20px;
+  border-radius: 12px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+  margin-bottom: 20px;
+}
+.filters {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.filters select,
+.filters input[type="text"] {
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 2px solid #e2e8f0;
+  font-size: 14px;
+  outline: none;
+  transition: all 0.3s ease;
+  background: white;
+  color: #334155;
+  font-weight: 500;
+}
+.filters select:focus,
+.filters input[type="text"]:focus {
+  border-color: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.1);
+}
+.filters input[type="text"] {
+  min-width: 250px;
+}
+.filters select {
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23334155' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 36px;
+}
+.btn {
+  padding: 10px 18px;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.search-btn {
+  background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+  color: white;
+  box-shadow: 0 2px 8px rgba(245, 158, 11, 0.3);
+}
+.search-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(245, 158, 11, 0.4);
+}
+.clear-btn {
+  background: #64748b;
+  color: white;
+}
+.clear-btn:hover {
+  background: #475569;
+  transform: translateY(-2px);
+}
+.course-badge {
+  background: linear-gradient(135deg, #e0f2fe 0%, #bae6fd 100%);
+  padding: 12px 20px;
+  border-radius: 10px;
+  text-align: center;
+  margin-bottom: 16px;
+  border-left: 4px solid #0ea5e9;
+}
+.course-badge h3 {
+  font-size: 17px;
+  color: #0c4a6e;
+  font-weight: 600;
+  margin: 0;
+}
+.table-container {
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.06);
+  overflow: hidden;
+}
+.table-scroll {
+  overflow-x: auto;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 1000px;
+}
+thead {
+  background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+th {
+  padding: 16px 14px;
+  text-align: left;
+  color: white;
+  font-weight: 600;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+td {
+  padding: 14px;
+  border-bottom: 1px solid #f1f5f9;
+  color: #334155;
+  font-size: 14px;
+}
+tbody tr {
+  transition: all 0.2s ease;
+}
+tbody tr:hover {
+  background: #fffbeb;
+}
+tbody tr:last-child td {
+  border-bottom: none;
+}
+.badge {
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 12px;
+  display: inline-block;
+  white-space: nowrap;
+}
+.badge-course {
+  background: #dbeafe;
+  color: #1e40af;
+}
+.badge-year {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+.penalty-badge {
+  background: #fee2e2;
+  color: #991b1b;
+  font-weight: 700;
+  font-size: 14px;
+}
+.penalty-badge.zero {
+  background: #dcfce7;
+  color: #166534;
+}
+.action-btns {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.action-btn {
+  padding: 6px 12px;
+  border: none;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.btn-view {
+  background: #0ea5e9;
+  color: white;
+}
+.btn-view:hover {
+  background: #0284c7;
+  transform: translateY(-1px);
+}
+.btn-pay {
+  background: #10b981;
+  color: white;
+}
+.btn-pay:hover {
+  background: #059669;
+  transform: translateY(-1px);
+}
+.btn-service {
+  background: #8b5cf6;
+  color: white;
+}
+.btn-service:hover {
+  background: #7c3aed;
+  transform: translateY(-1px);
+}
+.empty-state {
+  text-align: center;
+  padding: 60px 20px;
+  color: #64748b;
+  font-size: 15px;
+}
+.empty-state i {
+  font-size: 64px;
+  color: #cbd5e1;
+  margin-bottom: 16px;
+}
+.fine-item {
+  padding: 12px;
+  margin-bottom: 8px;
+  border: 2px solid #8b5cf6;
+  background: #ede9fe;
+  border-radius: 8px;
+  transition: all 0.2s;
+}
+.fine-item:hover {
+  border-color: #7c3aed;
+  background: #ddd6fe;
+}
+.fine-item.selected {
+  border-color: #8b5cf6;
+  background: #ede9fe;
+}
+.fine-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.fine-details {
+  flex: 1;
+}
+.fine-name {
+  font-weight: 600;
+  color: #1e3a5f;
+  margin-bottom: 4px;
+}
+.fine-amount {
+  color: #ef4444;
+  font-weight: 700;
+  font-size: 16px;
+}
+.discount-input-area {
+  margin-top: 10px;
+  padding: 10px;
+  background: #f8fafc;
+  border-radius: 6px;
+  display: block;
+}
+.discount-input-area label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: #64748b;
+  margin-bottom: 6px;
+}
+.discount-input-area input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 2px solid #e2e8f0;
+  border-radius: 6px;
+  font-size: 14px;
+  outline: none;
+  transition: all 0.2s;
+}
+.discount-input-area input:focus {
+  border-color: #8b5cf6;
+}
+.new-amount-display {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #64748b;
+}
+.new-amount-display strong {
+  color: #10b981;
+  font-size: 14px;
+}
+.total-display {
+  margin-top: 12px;
+  padding: 12px;
+  background: #f0f9ff;
+  border-radius: 8px;
+  border-left: 4px solid #0ea5e9;
+}
+.total-display p {
+  margin: 0;
+  font-weight: 600;
+  color: #0c4a6e;
+}
+.total-display .amount {
+  color: #ef4444;
+  font-size: 20px;
+}
+</style>
+</head>
+<body>
+<div class="container">
+    <div class="page-header">
+        <i class="fa-solid fa-file-invoice-dollar"></i>
+        <h2>Fines Records</h2>
+    </div>
+    <div style="margin-bottom: 20px;">
+        <div class="stat-card" style="max-width: 300px;">
+            <h4>Total Amount</h4>
+            <p>₱<?= number_format($stats['total_amount'] ?? 0, 2) ?></p>
+        </div>
+    </div>
+    <div class="controls">
+        <form method="get" class="filters" id="filterForm">
+            <select name="course" onchange="this.form.submit()">
+                <?php 
+                $courses_result->data_seek(0);
+                while($course = $courses_result->fetch_assoc()): 
+                ?>
+                    <option value="<?= htmlspecialchars($course['Course']) ?>" 
+                            <?= $course_filter == $course['Course'] ? 'selected' : '' ?>>
+                        <?= htmlspecialchars($course['Course']) ?>
+                    </option>
+                <?php endwhile; ?>
+            </select>
+            <select name="year" onchange="this.form.submit()">
+                <option value="">All Year Levels</option>
+                <option value="1stYear" <?= $year_filter == '1stYear' ? 'selected' : '' ?>>1st Year</option>
+                <option value="2ndYear" <?= $year_filter == '2ndYear' ? 'selected' : '' ?>>2nd Year</option>
+                <option value="3rdYear" <?= $year_filter == '3rdYear' ? 'selected' : '' ?>>3rd Year</option>
+                <option value="4thYear" <?= $year_filter == '4thYear' ? 'selected' : '' ?>>4th Year</option>
+            </select>
+            <select name="semester" id="semesterFilter" onchange="saveSemesterFilter(); this.form.submit()">
+                <option value="">All Semesters</option>
+                <option value="First Semester" <?= $semester_filter === 'First Semester' ? 'selected' : '' ?>>First Semester</option>
+                <option value="Second Semester" <?= $semester_filter === 'Second Semester' ? 'selected' : '' ?>>Second Semester</option>
+            </select>
+            <select name="school_year" id="schoolYearFilter" onchange="saveSchoolYearFilter(); this.form.submit()">
+                <option value="">All School Years</option>
+                <?php 
+                for($year = 2023; $year <= 2033; $year++) {
+                    $schoolYear = $year . '-' . ($year + 1);
+                    $selected = ($school_year_filter === $schoolYear) ? 'selected' : '';
+                    echo '<option value="' . $schoolYear . '" ' . $selected . '>' . $schoolYear . '</option>';
+                }
+                ?>
+            </select>
+            <input type="text" name="search" placeholder="Search by Student ID or Name..." value="<?= htmlspecialchars($search) ?>">
+            <button type="submit" class="btn search-btn">
+                <i class="fa fa-search"></i> Search
+            </button>
+            <button type="button" class="btn clear-btn" onclick="clearFilters()">
+                <i class="fa fa-rotate"></i> Clear
+            </button>
+        </form>
+    </div>
+    <div class="course-badge">
+        <h3><?= htmlspecialchars(getCourseName($course_filter)) ?></h3>
+    </div>
+    <div class="table-container">
+        <div class="table-scroll">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Student ID</th>
+                        <th>Full Name</th>
+                        <th>Course</th>
+                        <th>Section</th>
+                        <th>Year Level</th>
+                        <th>Total Penalty</th>
+                        <th>Fine Records</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php if ($result && $result->num_rows > 0): ?>
+                    <?php while($row = $result->fetch_assoc()): ?>
+                    <tr>
+                        <td><strong><?= htmlspecialchars($row['students_id']) ?></strong></td>
+                        <td><?= htmlspecialchars($row['FullName']) ?></td>
+                        <td><span class="badge badge-course"><?= htmlspecialchars($row['Course']) ?></span></td>
+                        <td><?= htmlspecialchars($row['Section'] ?? 'N/A') ?></td>
+                        <td><span class="badge badge-year"><?= htmlspecialchars($row['YearLevel']) ?></span></td>
+                        <td><span class="penalty-badge">₱<?= number_format($row['TotalPenalty'], 2) ?></span></td>
+                        <td><?= $row['TotalFines'] ?> record<?= $row['TotalFines'] > 1 ? 's' : '' ?></td>
+                        <td>
+                            <div class="action-btns">
+                                <button class="action-btn btn-view" onclick="viewDetails('<?= $row['students_id'] ?>')">
+                                    <i class="fa fa-eye"></i> View
+                                </button>
+                                <button class="action-btn btn-pay" onclick='payFine(<?= json_encode(["student_id" => $row["students_id"], "fullname" => $row["FullName"], "fines_ids" => explode(",", $row["FinesIds"]), "penalty_amounts" => explode(",", $row["PenaltyAmounts"]), "event_names" => explode("|||", $row["EventNames"])]) ?>)'>
+                                    <i class="fa fa-money-bill"></i> Pay
+                                </button>
+                                <button class="action-btn btn-service" onclick='applyService(<?= json_encode(["student_id" => $row["students_id"], "fullname" => $row["FullName"], "fines_ids" => explode(",", $row["FinesIds"]), "penalty_amounts" => explode(",", $row["PenaltyAmounts"]), "event_names" => explode("|||", $row["EventNames"])]) ?>)'>
+                                    <i class="fa fa-hand-holding-heart"></i> Service
+                                </button>
+                            </div>
+                        </td>
+                    </tr>
+                    <?php endwhile; ?>
+                <?php else: ?>
+                    <tr>
+                        <td colspan="8">
+                            <div class="empty-state">
+                                <i class="fa fa-file-invoice"></i>
+                                <h3>No Fines Records Found</h3>
+                                <p>No students have unpaid fines matching your search criteria.</p>
+                            </div>
+                        </td>
+                    </tr>
+                <?php endif; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+<script>
+window.addEventListener('DOMContentLoaded', function() {
+    loadSavedFilters();
+});
+function loadSavedFilters() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const savedSemester = localStorage.getItem('finesSemesterFilter');
+    const semesterSelect = document.getElementById('semesterFilter');
+    if (savedSemester && savedSemester !== 'all' && semesterSelect) {
+        if (!urlParams.has('semester')) {
+            semesterSelect.value = savedSemester;
+            if (semesterSelect.value && !window.location.search.includes('semester=')) {
+                urlParams.set('semester', savedSemester);
+                window.location.search = urlParams.toString();
+                return;
+            }
+        }
+    }
+    const savedSchoolYear = localStorage.getItem('finesSchoolYearFilter');
+    const schoolYearSelect = document.getElementById('schoolYearFilter');
+    if (savedSchoolYear && savedSchoolYear !== 'all' && schoolYearSelect) {
+        if (!urlParams.has('school_year')) {
+            schoolYearSelect.value = savedSchoolYear;
+            if (schoolYearSelect.value && !window.location.search.includes('school_year=')) {
+                urlParams.set('school_year', savedSchoolYear);
+                window.location.search = urlParams.toString();
+                return;
+            }
+        }
+    }
+}
+function saveSemesterFilter() {
+    const semesterValue = document.getElementById('semesterFilter').value;
+    if (semesterValue) {
+        localStorage.setItem('finesSemesterFilter', semesterValue);
+    } else {
+        localStorage.setItem('finesSemesterFilter', 'all');
+    }
+}
+function saveSchoolYearFilter() {
+    const schoolYearValue = document.getElementById('schoolYearFilter').value;
+    if (schoolYearValue) {
+        localStorage.setItem('finesSchoolYearFilter', schoolYearValue);
+    } else {
+        localStorage.setItem('finesSchoolYearFilter', 'all');
+    }
+}
+function clearFilters() {
+    localStorage.removeItem('finesSemesterFilter');
+    localStorage.removeItem('finesSchoolYearFilter');
+    window.location.href = 'fines.php';
+}
+let selectedFines = [];
+let serviceDiscounts = {};
+function viewDetails(studentId) {
+    window.location.href = `fines_record.php?student_id=${studentId}`;
+}
+function applyService(data) {
+    selectedFines = [];
+    serviceDiscounts = {};
+    
+    // AUTO-SELECT ALL FINES
+    data.fines_ids.forEach((fineId, index) => {
+        const penaltyAmount = parseFloat(data.penalty_amounts[index]);
+        const eventName = data.event_names[index];
+        selectedFines.push({ 
+            fines_id: parseInt(fineId), 
+            penalty_amount: penaltyAmount, 
+            event_name: eventName 
+        });
+    });
+    
+    const totalPenalty = selectedFines.reduce((sum, fine) => sum + fine.penalty_amount, 0);
+    
+    let finesHtml = '<div style="text-align: left;">';
+    finesHtml += `<p style="margin-bottom: 8px;"><strong>Student:</strong> ${data.fullname}</p>`;
+    finesHtml += `<p style="margin-bottom: 15px;"><strong>Student ID:</strong> ${data.student_id}</p>`;
+    finesHtml += '<hr style="margin: 15px 0;">';
+    finesHtml += '<p style="font-size: 13px; color: #64748b; margin-bottom: 12px;"><i class="fa fa-info-circle"></i> All fines are selected</p>';
+    finesHtml += '<div style="max-height: 300px; overflow-y: auto; margin-bottom: 15px;">';
+    data.fines_ids.forEach((fineId, index) => {
+        const penaltyAmount = parseFloat(data.penalty_amounts[index]);
+        const eventName = data.event_names[index];
+        finesHtml += `<div class="fine-item selected" id="service-fine-${fineId}">
+            <div class="fine-header">
+                <div class="fine-details">
+                    <p class="fine-name">${eventName}</p>
+                    <p class="fine-amount">₱${penaltyAmount.toFixed(2)}</p>
+                </div>
+            </div>
+        </div>`;
+    });
+    finesHtml += '</div>';
+    
+    finesHtml += `<div style="padding: 15px; background: #fef3c7; border-radius: 8px; margin-bottom: 15px;">
+        <p style="margin: 0 0 5px 0; font-weight: 700; color: #92400e; font-size: 16px;">Total Penalty: ₱${totalPenalty.toFixed(2)}</p>
+        <p style="margin: 0; font-size: 13px; color: #78350f;">Selected Fines: ${selectedFines.length}</p>
+    </div>`;
+    
+    finesHtml += `<div style="padding: 15px; background: #f5f3ff; border-radius: 8px; border: 2px solid #8b5cf6;">
+        <label style="display: block; margin-bottom: 8px; font-weight: 600; color: #1e3a5f; font-size: 15px;">
+            <i class="fa fa-tag"></i> Total Discount Amount <span style="color: red;">*</span>
+        </label>
+        <input type="number" id="total_discount_amount" class="swal2-input" 
+               style="width: 100%; margin: 0; padding: 12px; font-size: 16px; border: 2px solid #8b5cf6;" 
+               placeholder="Enter total discount amount" 
+               step="0.01" min="0" max="${totalPenalty}"
+               oninput="updateTotalServiceDiscount(${totalPenalty})">
+        <div id="discount_breakdown" style="margin-top: 12px; padding: 12px; background: white; border-radius: 6px; display: none;">
+            <p style="margin: 0 0 8px 0; font-size: 13px; color: #64748b; font-weight: 600;">
+                <i class="fa fa-calculator"></i> Discount Breakdown:
+            </p>
+            <div id="breakdown_list" style="font-size: 13px; color: #475569;"></div>
+            <hr style="margin: 10px 0;">
+            <p style="margin: 0; font-weight: 700; color: #10b981; font-size: 14px;">
+                New Total: <span id="new_total_amount">₱0.00</span>
+            </p>
+        </div>
+    </div>`;
+    
+    finesHtml += '</div>';
+    
+    Swal.fire({
+        title: 'Apply Service Discount',
+        html: finesHtml,
+        width: '650px',
+        showCancelButton: true,
+        showConfirmButton: true,
+        confirmButtonText: '<i class="fa fa-check-circle"></i> Apply Discount',
+        confirmButtonColor: '#8b5cf6',
+        cancelButtonText: 'Cancel',
+        cancelButtonColor: '#64748b',
+        preConfirm: () => {
+            const totalDiscount = parseFloat(document.getElementById('total_discount_amount').value) || 0;
+            
+            if (totalDiscount <= 0) {
+                Swal.showValidationMessage('Please enter a discount amount');
+                return false;
+            }
+            
+            if (totalDiscount > totalPenalty) {
+                Swal.showValidationMessage('Discount cannot exceed total penalty amount');
+                return false;
+            }
+            
+            // Distribute discount proportionally
+            selectedFines.forEach(fine => {
+                const proportion = fine.penalty_amount / totalPenalty;
+                serviceDiscounts[fine.fines_id] = totalDiscount * proportion;
+            });
+            
+            return true;
+        }
+    }).then((result) => {
+        if (result.isConfirmed && selectedFines.length > 0) {
+            processServiceDiscount(data.student_id, data.fullname);
+        }
+    });
+}
+function updateTotalServiceDiscount(totalPenalty) {
+    const totalDiscountInput = document.getElementById('total_discount_amount');
+    const discountBreakdown = document.getElementById('discount_breakdown');
+    const breakdownList = document.getElementById('breakdown_list');
+    const newTotalAmount = document.getElementById('new_total_amount');
+    
+    const totalDiscount = parseFloat(totalDiscountInput.value) || 0;
+    
+    if (totalDiscount > 0) {
+        discountBreakdown.style.display = 'block';
+        
+        let breakdownHtml = '';
+        selectedFines.forEach(fine => {
+            const proportion = fine.penalty_amount / totalPenalty;
+            const individualDiscount = totalDiscount * proportion;
+            const newAmount = fine.penalty_amount - individualDiscount;
+            
+            breakdownHtml += `<p style="margin: 4px 0;">
+                <strong>${fine.event_name}:</strong><br>
+                <span style="color: #ef4444;">₱${fine.penalty_amount.toFixed(2)}</span> - 
+                <span style="color: #8b5cf6;">₱${individualDiscount.toFixed(2)}</span> = 
+                <span style="color: #10b981;">₱${newAmount.toFixed(2)}</span>
+            </p>`;
+        });
+        
+        breakdownList.innerHTML = breakdownHtml;
+        
+        const finalTotal = totalPenalty - totalDiscount;
+        newTotalAmount.textContent = '₱' + finalTotal.toFixed(2);
+    } else {
+        discountBreakdown.style.display = 'none';
+    }
+}
+function updateServiceAmount(fineId, penaltyAmount) {
+    const discountInput = document.getElementById(`discount-${fineId}`);
+    const newAmountDisplay = document.getElementById(`new-amount-${fineId}`);
+    const discount = parseFloat(discountInput.value) || 0;
+    serviceDiscounts[fineId] = discount;
+    const newAmount = penaltyAmount - discount;
+    if (discount > 0) {
+        newAmountDisplay.innerHTML = `New Penalty Amount: <strong>₱${newAmount.toFixed(2)}</strong>`;
+    } else {
+        newAmountDisplay.innerHTML = '';
+    }
+    updateServiceTotalDisplay();
+}
+function updateServiceTotalDisplay() {
+    const totalDiscount = document.getElementById('serviceTotalDiscount');
+    let total = 0;
+    selectedFines.forEach(fine => {
+        total += (serviceDiscounts[fine.fines_id] || 0);
+    });
+    totalDiscount.textContent = '₱' + total.toFixed(2);
+}
+function processServiceDiscount(studentId, fullName) {
+    const finesWithDiscount = selectedFines.map(fine => ({
+        fines_id: fine.fines_id,
+        penalty_amount: fine.penalty_amount,
+        discount: serviceDiscounts[fine.fines_id] || 0,
+        event_name: fine.event_name
+    }));
+    let summaryHtml = '<ul style="text-align: left; margin: 10px 0; padding-left: 20px;">';
+    finesWithDiscount.forEach(fine => {
+        const newAmount = fine.penalty_amount - fine.discount;
+        summaryHtml += `<li style="margin-bottom: 8px;"><strong>${fine.event_name}</strong><br><span style="color: #ef4444;">Original: ₱${fine.penalty_amount.toFixed(2)}</span> <span style="color: #8b5cf6;">- Discount: ₱${fine.discount.toFixed(2)}</span> <span style="color: #10b981;">= New: ₱${newAmount.toFixed(2)}</span></li>`;
+    });
+    summaryHtml += '</ul>';
+    Swal.fire({
+        title: 'Confirm Service Discount',
+        html: `<div style="text-align: left; padding: 15px;"><p style="margin-bottom: 8px;"><strong>Student:</strong> ${fullName}</p><p style="margin-bottom: 8px;"><strong>Student ID:</strong> ${studentId}</p><hr style="margin: 12px 0;"><p style="margin-bottom: 8px; font-weight: 600; color: #1e3a5f;">Service Discounts (${finesWithDiscount.length}):</p>${summaryHtml}<hr style="margin: 12px 0;"><p style="font-size: 13px; color: #64748b; margin: 0;"><i class="fa fa-info-circle"></i> This will reduce the PenaltyAmount in the database</p></div>`,
+        width: '600px',
+        showCancelButton: true,
+        confirmButtonColor: '#8b5cf6',
+        cancelButtonColor: '#64748b',
+        confirmButtonText: '<i class="fa fa-check-circle"></i> Confirm & Apply',
+        cancelButtonText: '<i class="fa fa-times"></i> Cancel'
+    }).then((result) => {
+        if (result.isConfirmed) {
+            submitServiceDiscount(studentId, finesWithDiscount);
+        }
+    });
+}
+function submitServiceDiscount(studentId, finesWithDiscount) {
+    Swal.fire({
+        title: 'Processing Service...',
+        html: 'Please wait while we apply the service discount',
+        allowOutsideClick: false,
+        allowEscapeKey: false,
+        didOpen: () => {
+            Swal.showLoading();
+        }
+    });
+    const formData = new FormData();
+    formData.append('action', 'apply_service_discount');
+    formData.append('students_id', studentId);
+    formData.append('selected_fines', JSON.stringify(finesWithDiscount));
+    fetch('fines.php', {
+        method: 'POST',
+        body: formData
+    }).then(response => response.json()).then(data => {
+        if (data.success) {
+            Swal.fire({
+                icon: 'success',
+                title: 'Service Discount Applied!',
+                html: `<div style="text-align: left; padding: 15px;"><p style="margin-bottom: 8px;"><strong>Fines Processed:</strong> ${data.fines_processed}</p><hr style="margin: 12px 0;"><p style="font-size: 13px; color: #64748b; margin: 0;"><i class="fa fa-info-circle"></i> PenaltyAmount has been updated in the database</p><p style="font-size: 13px; color: #64748b; margin: 8px 0 0 0;"><i class="fa fa-check-circle"></i> Service records have been saved to comservice table</p></div>`,
+                confirmButtonColor: '#8b5cf6',
+                confirmButtonText: '<i class="fa fa-check"></i> OK'
+            }).then(() => {
+                location.reload();
+            });
+        } else {
+            Swal.fire({
+                icon: 'error',
+                title: 'Service Failed',
+                text: data.message,
+                confirmButtonColor: '#ef4444'
+            });
+        }
+    }).catch(error => {
+        Swal.fire({
+            icon: 'error',
+            title: 'Error',
+            text: 'An error occurred while processing service',
+            confirmButtonColor: '#ef4444'
+        });
+        console.error('Error:', error);
+    });
+}
+function payFine(data) {
+    selectedFines = [];
+    
+    // AUTO-SELECT ALL FINES
+    data.fines_ids.forEach((fineId, index) => {
+        const penaltyAmount = parseFloat(data.penalty_amounts[index]);
+        const eventName = data.event_names[index];
+        selectedFines.push({ 
+            fines_id: parseInt(fineId), 
+            penalty_amount: penaltyAmount, 
+            event_name: eventName 
+        });
+    });
+    
+    const totalPenalty = selectedFines.reduce((sum, fine) => sum + fine.penalty_amount, 0);
+    
+    let finesHtml = '<div style="text-align: left;">';
+    finesHtml += `<p style="margin-bottom: 8px;"><strong>Student:</strong> ${data.fullname}</p>`;
+    finesHtml += `<p style="margin-bottom: 15px;"><strong>Student ID:</strong> ${data.student_id}</p>`;
+    finesHtml += '<hr style="margin: 15px 0;">';
+    finesHtml += '<p style="font-size: 13px; color: #64748b; margin-bottom: 12px;"><i class="fa fa-info-circle"></i> All fines are selected</p>';
+    finesHtml += '<div style="max-height: 300px; overflow-y: auto;">';
+    data.fines_ids.forEach((fineId, index) => {
+        const penaltyAmount = parseFloat(data.penalty_amounts[index]);
+        const eventName = data.event_names[index];
+        finesHtml += `<div class="fine-item selected" id="pay-fine-${fineId}">
+            <div style="display: flex; align-items: center; gap: 12px;">
+                <div class="fine-details">
+                    <p class="fine-name">${eventName}</p>
+                    <p class="fine-amount">₱${penaltyAmount.toFixed(2)}</p>
+                </div>
+            </div>
+        </div>`;
+    });
+    finesHtml += '</div>';
+    finesHtml += `<div class="total-display" id="paymentTotalDisplay">
+        <p>Selected Fines: <span id="paymentSelectedCount">${selectedFines.length}</span></p>
+        <p>Total Amount: <span class="amount" id="paymentTotalAmount">₱${totalPenalty.toFixed(2)}</span></p>
+    </div>`;
+    finesHtml += '</div>';
+    Swal.fire({
+        title: 'Payment for All Fines',
+        html: finesHtml,
+        width: '600px',
+        showCancelButton: true,
+        showConfirmButton: true,
+        confirmButtonText: '<i class="fa fa-arrow-right"></i> Continue to Payment',
+        confirmButtonColor: '#10b981',
+        cancelButtonText: 'Cancel',
+        cancelButtonColor: '#64748b'
+    }).then((result) => {
+        if (result.isConfirmed) {
+            showPaymentForm(data.student_id, data.fullname);
+        }
+    });
+}
+function showPaymentForm(studentId, fullName) {
+    const totalPenalty = selectedFines.reduce((sum, fine) => sum + fine.penalty_amount, 0);
+    let eventsHtml = '<ul style="text-align: left; margin: 10px 0; padding-left: 20px;">';
+    selectedFines.forEach(fine => {
+        eventsHtml += `<li style="margin-bottom: 5px;"><strong>${fine.event_name}</strong> - <span style="color: #ef4444; font-weight: 700;">₱${fine.penalty_amount.toFixed(2)}</span></li>`;
+    });
+    eventsHtml += '</ul>';
+    Swal.fire({
+        title: 'Payment Details',
+        html: `<div style="text-align: left; padding: 15px;"><p style="margin-bottom: 8px;"><strong>Student:</strong> ${fullName}</p><p style="margin-bottom: 8px;"><strong>Student ID:</strong> ${studentId}</p><hr style="margin: 12px 0;"><p style="margin-bottom: 8px; font-weight: 600; color: #1e3a5f;">Selected Fines (${selectedFines.length}):</p>${eventsHtml}<div style="padding: 10px; background: #fef3c7; border-radius: 8px; margin-bottom: 15px;"><p style="margin: 0; font-weight: 700; color: #92400e; font-size: 16px;">Total Penalty: ₱${totalPenalty.toFixed(2)}</p></div><hr style="margin: 15px 0;"><div style="margin-bottom: 15px;"><label style="display: block; margin-bottom: 5px; font-weight: 600; color: #1e3a5f;">Payment Amount <span style="color: red;">*</span></label><input type="number" id="payment_amount" class="swal2-input" style="width: 100%; margin: 0;" placeholder="Enter amount" step="0.01" min="0.01" max="${totalPenalty}"></div><div style="margin-bottom: 15px;"><label style="display: block; margin-bottom: 5px; font-weight: 600; color: #1e3a5f;">Payment Type <span style="color: red;">*</span></label><select id="payment_type" class="swal2-input" style="width: 100%; margin: 0;"><option value="Cash">Cash</option><option value="Gcash">Gcash</option><option value="Other">Other</option></select></div><div id="balance_display" style="margin-top: 15px; padding: 12px; background: #f0f9ff; border-radius: 8px; display: none; border-left: 4px solid #0ea5e9;"><p style="margin: 0; font-weight: 600; color: #0c4a6e;">Balance: <span id="balance_amount" style="color: #ef4444; font-size: 18px;">₱0.00</span></p><p style="margin: 5px 0 0 0; font-size: 13px; color: #64748b;">Status: <span id="payment_status" style="font-weight: 600;"></span></p></div></div>`,
+        width: '600px',
+        showCancelButton: true,
+        confirmButtonColor: '#10b981',
+        cancelButtonColor: '#64748b',
+        confirmButtonText: '<i class="fa fa-check-circle"></i> Process Payment',
+        cancelButtonText: '<i class="fa fa-times"></i> Cancel',
+        preConfirm: () => {
+            const paymentAmount = parseFloat(document.getElementById('payment_amount').value);
+            const paymentType = document.getElementById('payment_type').value;
+            if (!paymentAmount || paymentAmount <= 0) {
+                Swal.showValidationMessage('Please enter a valid payment amount');
+                return false;
+            }
+            if (paymentAmount > totalPenalty) {
+                Swal.showValidationMessage('Payment amount cannot exceed total penalty amount');
+                return false;
+            }
+            return {
+                students_id: studentId,
+                selected_fines: selectedFines,
+                payment_amount: paymentAmount,
+                payment_type: paymentType,
+                total_penalty: totalPenalty
+            };
+        },
+        didOpen: () => {
+            const paymentInput = document.getElementById('payment_amount');
+            const balanceDisplay = document.getElementById('balance_display');
+            const balanceAmount = document.getElementById('balance_amount');
+            const paymentStatus = document.getElementById('payment_status');
+            paymentInput.addEventListener('input', function() {
+                const payment = parseFloat(this.value) || 0;
+                const balance = totalPenalty - payment;
+                if (payment > 0) {
+                    balanceDisplay.style.display = 'block';
+                    balanceAmount.textContent = '₱' + balance.toFixed(2);
+                    if (balance <= 0) {
+                        paymentStatus.textContent = 'Paid';
+                        paymentStatus.style.color = '#10b981';
+                        balanceDisplay.style.borderLeftColor = '#10b981';
+                        balanceDisplay.style.backgroundColor = '#f0fdf4';
+                    } else {
+                        paymentStatus.textContent = 'Partial Paid';
+                        paymentStatus.style.color = '#f59e0b';
+                        balanceDisplay.style.borderLeftColor = '#f59e0b';
+                        balanceDisplay.style.backgroundColor = '#fffbeb';
+                    }
+                } else {
+                    balanceDisplay.style.display = 'none';
+                }
+            });
+        }
+    }).then((result) => {
+        if (result.isConfirmed && result.value) {
+            processPayment(result.value);
+        }
+    });
+}
+function processPayment(paymentData) {
+    Swal.fire({
+        title: 'Processing Payment...',
+        html: 'Please wait while we process your payment',
+        allowOutsideClick: false,
+        allowEscapeKey: false,
+        didOpen: () => {
+            Swal.showLoading();
+        }
+    });
+    const formData = new FormData();
+    formData.append('action', 'process_payment');
+    formData.append('students_id', paymentData.students_id);
+    formData.append('selected_fines', JSON.stringify(paymentData.selected_fines));
+    formData.append('payment_amount', paymentData.payment_amount);
+    formData.append('payment_type', paymentData.payment_type);
+    formData.append('total_penalty', paymentData.total_penalty);
+    fetch('fines.php', {
+        method: 'POST',
+        body: formData
+    }).then(response => response.json()).then(data => {
+        if (data.success) {
+            Swal.fire({
+                icon: 'success',
+                title: 'Payment Successful!',
+                html: `<div style="text-align: left; padding: 15px;"><p style="margin-bottom: 8px;"><strong>Fines Paid:</strong> ${data.fines_paid}</p><p style="margin-bottom: 8px;"><strong>Payment Status:</strong> <span style="color: ${data.payment_status === 'Paid' ? '#10b981' : '#f59e0b'}; font-weight: 700;">${data.payment_status}</span></p><p style="margin-bottom: 8px;"><strong>Remaining Balance:</strong> <span style="color: #ef4444; font-weight: 700;">₱${data.balance}</span></p><hr style="margin: 12px 0;"><p style="font-size: 13px; color: #64748b; margin: 0;"><i class="fa fa-info-circle"></i> PenaltyAmount has been updated in the database</p></div>`,
+                confirmButtonColor: '#10b981',
+                confirmButtonText: '<i class="fa fa-check"></i> OK'
+            }).then(() => {
+                location.reload();
+            });
+        } else {
+            Swal.fire({
+                icon: 'error',
+                title: 'Payment Failed',
+                text: data.message,
+                confirmButtonColor: '#ef4444'
+            });
+        }
+    }).catch(error => {
+        Swal.fire({
+            icon: 'error',
+            title: 'Error',
+            text: 'An error occurred while processing payment',
+            confirmButtonColor: '#ef4444'
+        });
+        console.error('Error:', error);
+    });
+}
+</script>
+</body>
+</html>
+<?php $conn->close(); ?>
