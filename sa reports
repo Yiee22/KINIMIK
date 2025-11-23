@@ -1,0 +1,1037 @@
+<?php
+session_start();
+if (!isset($_SESSION['username']) || !in_array($_SESSION['usertype'], ['Secretary', 'Treasurer', 'Auditor', 'Social Manager', 'Senator', 'Governor', 'Vice Governor'])) {
+    header("Location: ../login.php");
+    exit();
+}
+
+$conn = new mysqli("localhost", "root", "", "csso");
+if ($conn->connect_error) die("Connection failed: " . $conn->connect_error);
+
+$report_type = $_GET['report_type'] ?? 'individual_statement';
+$semester_filter = $_GET['semester'] ?? '';
+$school_year_filter = $_GET['school_year'] ?? '';
+$year_level_filter = $_GET['year_level'] ?? '';
+$section_filter = $_GET['section'] ?? '';
+$student_id_filter = $_GET['student_id'] ?? '';
+
+function buildWhereClause($alias = 'r') {
+    global $semester_filter, $school_year_filter;
+    $w = "";
+    if (!empty($school_year_filter) && !empty($semester_filter)) {
+        $w = " AND {$alias}.school_year = '$school_year_filter' AND {$alias}.semester = '$semester_filter'";
+    } elseif (!empty($school_year_filter)) {
+        $w = " AND {$alias}.school_year = '$school_year_filter'";
+    } elseif (!empty($semester_filter)) {
+        $w = " AND {$alias}.semester = '$semester_filter'";
+    }
+    return $w;
+}
+
+$chart_data = ['registration' => 0, 'attendance' => 0, 'events' => 0, 'fines' => 0, 'paid' => 0, 'unpaid' => 0];
+$yearly_data = [];
+
+$res = $conn->query("SELECT COUNT(*) as cnt FROM registration r WHERE 1=1" . buildWhereClause('r'));
+if ($res) $chart_data['registration'] = $res->fetch_assoc()['cnt'];
+
+$res = $conn->query("SELECT COUNT(*) as cnt FROM attendance");
+if ($res) $chart_data['attendance'] = $res->fetch_assoc()['cnt'];
+
+$res = $conn->query("SELECT COUNT(*) as cnt FROM event");
+if ($res) $chart_data['events'] = $res->fetch_assoc()['cnt'];
+
+$res = $conn->query("SELECT COALESCE(SUM(PenaltyAmount),0) as total FROM fines");
+if ($res) $chart_data['fines'] = $res->fetch_assoc()['total'];
+
+$res = $conn->query("SELECT SUM(CASE WHEN payment_status='Paid' THEN 1 ELSE 0 END) as paid, SUM(CASE WHEN payment_status='Unpaid' THEN 1 ELSE 0 END) as unpaid FROM registration r WHERE 1=1" . buildWhereClause('r'));
+if ($res) { $row = $res->fetch_assoc(); $chart_data['paid'] = $row['paid'] ?? 0; $chart_data['unpaid'] = $row['unpaid'] ?? 0; }
+
+$levels = ['1stYear', '2ndYear', '3rdYear', '4thYear'];
+foreach ($levels as $lvl) {
+    $sql = "SELECT COUNT(DISTINCT r.registration_no) as reg_count, COALESCE(SUM(CASE WHEN r.payment_status='Paid' THEN r.amount ELSE 0 END),0) as income FROM registration r JOIN student_profile sp ON r.students_id = sp.students_id WHERE sp.YearLevel = '$lvl'" . buildWhereClause('r');
+    $res = $conn->query($sql);
+    $yearly_data[$lvl] = $res ? $res->fetch_assoc() : ['reg_count' => 0, 'income' => 0];
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reports | CSSO</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f4f8;color:#1e3a5f}
+.container{padding:24px;max-width:1800px;margin:0 auto}
+.page-header{display:flex;align-items:center;gap:14px;margin-bottom:24px;padding-bottom:16px;border-bottom:3px solid #e0f2fe}
+.page-header i{background:linear-gradient(135deg,#0ea5e9,#0284c7);color:#fff;padding:14px;border-radius:12px;font-size:22px;box-shadow:0 4px 12px rgba(14,165,233,0.3)}
+.page-header h2{font-size:26px;font-weight:600}
+.filter-section{background:#fff;border-radius:12px;padding:24px;box-shadow:0 2px 8px rgba(0,0,0,0.04);margin-bottom:24px}
+.filter-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:16px}
+.filter-group{display:flex;flex-direction:column}
+.filter-group label{font-weight:600;color:#1e3a5f;margin-bottom:8px;font-size:14px}
+.filter-group select,.filter-group input{padding:10px 14px;border-radius:8px;border:2px solid #e2e8f0;font-size:14px;outline:none;transition:all .3s;background:#fff;color:#334155;font-weight:500}
+.filter-group select:focus,.filter-group input:focus{border-color:#0ea5e9;box-shadow:0 0 0 3px rgba(14,165,233,0.1)}
+.filter-group select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23334155' d='M6 9L1 4h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;padding-right:36px}
+.filter-actions{display:flex;gap:12px;flex-wrap:wrap}
+.btn{padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:all .3s;display:inline-flex;align-items:center;gap:8px}
+.btn-primary{background:linear-gradient(135deg,#0ea5e9,#0284c7);color:#fff;box-shadow:0 2px 8px rgba(14,165,233,0.3)}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(14,165,233,0.4)}
+.btn-secondary{background:#64748b;color:#fff}
+.btn-secondary:hover{background:#475569;transform:translateY(-2px)}
+.btn-success{background:linear-gradient(135deg,#10b981,#059669);color:#fff;box-shadow:0 2px 8px rgba(16,185,129,0.3)}
+.btn-success:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(16,185,129,0.4)}
+.charts-section{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:24px;margin-bottom:24px}
+.chart-card{background:#fff;border-radius:12px;padding:24px;box-shadow:0 2px 8px rgba(0,0,0,0.04)}
+.chart-card h3{font-size:18px;color:#0f172a;margin-bottom:16px;display:flex;align-items:center;gap:10px}
+.chart-card h3 i{color:#0ea5e9}
+.chart-container{position:relative;height:280px}
+.report-content{background:#fff;border-radius:12px;padding:32px;box-shadow:0 2px 8px rgba(0,0,0,0.04);min-height:400px}
+.report-header{text-align:center;margin-bottom:32px;padding-bottom:24px;border-bottom:2px solid #e2e8f0}
+.report-header h3{font-size:24px;color:#0f172a;margin-bottom:8px}
+.report-header p{color:#64748b;font-size:14px}
+.report-table{width:100%;border-collapse:collapse;margin-bottom:24px}
+.report-table thead{background:linear-gradient(135deg,#0ea5e9,#0284c7)}
+.report-table th{padding:14px 12px;text-align:left;color:#fff;font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.5px}
+.report-table td{padding:12px;border-bottom:1px solid #f1f5f9;color:#334155;font-size:14px}
+.report-table tbody tr:hover{background:#f8fafc}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}
+.summary-card{background:linear-gradient(135deg,#f0f9ff,#e0f2fe);border-radius:12px;padding:20px;border-left:4px solid #0ea5e9}
+.summary-card h4{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.summary-card .value{font-size:24px;font-weight:700;color:#0284c7}
+.summary-card.success{background:linear-gradient(135deg,#f0fdf4,#dcfce7);border-left-color:#10b981}
+.summary-card.success .value{color:#059669}
+.summary-card.warning{background:linear-gradient(135deg,#fffbeb,#fef3c7);border-left-color:#f59e0b}
+.summary-card.warning .value{color:#d97706}
+.summary-card.danger{background:linear-gradient(135deg,#fef2f2,#fee2e2);border-left-color:#ef4444}
+.summary-card.danger .value{color:#dc2626}
+.badge{padding:4px 10px;border-radius:6px;font-weight:600;font-size:12px;display:inline-block}
+.badge-paid{background:#dcfce7;color:#166534}
+.badge-unpaid{background:#fee2e2;color:#991b1b}
+.badge-partial{background:#fef3c7;color:#92400e}
+.empty-state{text-align:center;padding:60px 20px;color:#64748b}
+.empty-state i{font-size:64px;color:#cbd5e1;margin-bottom:16px;display:block}
+.empty-state h3{font-size:18px;color:#475569;margin-bottom:8px}
+.section-header{background:linear-gradient(135deg,#f1f5f9,#e2e8f0);padding:12px 20px;border-radius:8px;margin:24px 0 16px;border-left:4px solid #0ea5e9}
+.section-header h4{font-size:16px;color:#0f172a;font-weight:600}
+.total-row{background:#f8fafc !important;font-weight:700 !important}
+.total-row td{color:#0f172a !important;border-top:2px solid #0ea5e9 !important}
+.tabs{display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap}
+.tab{padding:10px 20px;background:#e2e8f0;border-radius:8px;cursor:pointer;font-weight:600;color:#64748b;transition:all .3s}
+.tab:hover{background:#cbd5e1}
+.tab.active{background:linear-gradient(135deg,#0ea5e9,#0284c7);color:#fff}
+.divider{margin:24px 0;border:none;border-top:2px solid #e2e8f0}
+@media print{.filter-section,.btn,.page-header,.charts-section,.tabs{display:none !important}.report-content{box-shadow:none;padding:0}body{background:#fff}}
+</style>
+</head>
+<body>
+<div class="container">
+    <div class="page-header">
+        <i class="fa-solid fa-chart-line"></i>
+        <h2>Reports & Analytics</h2>
+    </div>
+
+    <div class="filter-section">
+        <form method="GET" id="filterForm">
+            <div class="filter-grid">
+                <div class="filter-group">
+                    <label>Report Type</label>
+                    <select name="report_type" id="reportType" onchange="toggleFilters()">
+                        <option value="individual_statement" <?php echo $report_type=='individual_statement'?'selected':''; ?>>Individual Statement</option>
+                        <option value="summary_penalty" <?php echo $report_type=='summary_penalty'?'selected':''; ?>>Summary of Penalties</option>
+                        <option value="collection_income" <?php echo $report_type=='collection_income'?'selected':''; ?>>Collection Income</option>
+                        <option value="attendance_report" <?php echo $report_type=='attendance_report'?'selected':''; ?>>Attendance Report</option>
+                        <option value="registration_report" <?php echo $report_type=='registration_report'?'selected':''; ?>>Registration Report</option>
+                        <option value="events_report" <?php echo $report_type=='events_report'?'selected':''; ?>>Events Report</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>School Year</label>
+                    <select name="school_year" id="schoolYearFilter" onchange="saveSchoolYearFilter(); this.form.submit()">
+                        <option value="">All School Years</option>
+                        <?php for($y=2023;$y<=2033;$y++){ $sy=$y.'-'.($y+1); echo '<option value="'.$sy.'"'.($school_year_filter===$sy?' selected':'').'>'.$sy.'</option>'; } ?>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>Semester</label>
+                    <select name="semester" id="semesterFilter" onchange="saveSemesterFilter(); this.form.submit()">
+                        <option value="">Overall (Both)</option>
+                        <option value="First Semester" <?php echo $semester_filter==='First Semester'?'selected':''; ?>>First Semester</option>
+                        <option value="Second Semester" <?php echo $semester_filter==='Second Semester'?'selected':''; ?>>Second Semester</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>Year Level</label>
+                    <select name="year_level">
+                        <option value="">All Year Levels</option>
+                        <option value="1stYear" <?php echo $year_level_filter=='1stYear'?'selected':''; ?>>1st Year</option>
+                        <option value="2ndYear" <?php echo $year_level_filter=='2ndYear'?'selected':''; ?>>2nd Year</option>
+                        <option value="3rdYear" <?php echo $year_level_filter=='3rdYear'?'selected':''; ?>>3rd Year</option>
+                        <option value="4thYear" <?php echo $year_level_filter=='4thYear'?'selected':''; ?>>4th Year</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>Section</label>
+                    <select name="section">
+                        <option value="">All Sections</option>
+                        <?php 
+                        $secs = ['BSIT 1A','BSIT 1B','BSIT 2A','BSIT 2B','BSIT 3A','BSIT 3B','BSIT 4A','BSIT 4B','BSCS 1A','BSCS 2A','BSCS 3A','BSCS 4A'];
+                        foreach($secs as $s) { echo '<option value="'.$s.'"'.($section_filter==$s?' selected':'').'>'.$s.'</option>'; }
+                        ?>
+                    </select>
+                </div>
+                <div class="filter-group" id="studentIdGroup" style="display:none">
+                    <label>Student ID</label>
+                    <input type="text" name="student_id" placeholder="Enter Student ID" value="<?php echo htmlspecialchars($student_id_filter); ?>">
+                </div>
+            </div>
+            <div class="filter-actions">
+                <button type="submit" class="btn btn-primary"><i class="fa fa-filter"></i> Generate Report</button>
+                <button type="button" class="btn btn-secondary" onclick="clearFilters()"><i class="fa fa-rotate"></i> Clear</button>
+                <button type="button" class="btn btn-success" onclick="window.print()"><i class="fa fa-print"></i> Print</button>
+                <button type="button" class="btn btn-success" onclick="exportToCSV()" style="background:linear-gradient(135deg,#059669,#047857)"><i class="fa fa-file-csv"></i> Export CSV</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="charts-section">
+        <div class="chart-card">
+            <h3><i class="fa fa-chart-pie"></i> Overview Distribution</h3>
+            <div class="chart-container"><canvas id="pieChart"></canvas></div>
+        </div>
+        <div class="chart-card">
+            <h3><i class="fa fa-chart-bar"></i> Income by Year Level</h3>
+            <div class="chart-container"><canvas id="barChart"></canvas></div>
+        </div>
+        <div class="chart-card">
+            <h3><i class="fa fa-circle-check"></i> Payment Status</h3>
+            <div class="chart-container"><canvas id="paymentPie"></canvas></div>
+        </div>
+        <div class="chart-card">
+            <h3><i class="fa fa-users"></i> Registration by Year Level</h3>
+            <div class="chart-container"><canvas id="regBar"></canvas></div>
+        </div>
+    </div>
+
+    <div class="report-content">
+<?php
+// ===================== INDIVIDUAL STATEMENT =====================
+if ($report_type == 'individual_statement') {
+    $where = "WHERE 1=1" . buildWhereClause('r');
+    if (!empty($student_id_filter)) $where .= " AND sp.students_id = '" . $conn->real_escape_string($student_id_filter) . "'";
+    if (!empty($year_level_filter)) $where .= " AND sp.YearLevel = '" . $conn->real_escape_string($year_level_filter) . "'";
+    if (!empty($section_filter)) $where .= " AND sp.Section = '" . $conn->real_escape_string($section_filter) . "'";
+    
+    $students = $conn->query("SELECT DISTINCT sp.students_id, sp.FirstName, sp.LastName, sp.MI, sp.Course, sp.YearLevel, sp.Section FROM student_profile sp INNER JOIN registration r ON sp.students_id = r.students_id $where ORDER BY sp.LastName");
+    
+    $filter_info = '';
+    if(!empty($semester_filter)) $filter_info .= $semester_filter.' • ';
+    if(!empty($school_year_filter)) $filter_info .= 'SY: '.$school_year_filter.' • ';
+    if(!empty($year_level_filter)) $filter_info .= $year_level_filter.' • ';
+    if(!empty($section_filter)) $filter_info .= $section_filter;
+    if(empty($filter_info)) $filter_info = 'Overall Records';
+?>
+    <div class="report-header">
+        <h3>Individual Statement of Records</h3>
+        <p><?php echo $filter_info; ?></p>
+    </div>
+    
+    <div class="tabs">
+        <div class="tab <?php echo empty($semester_filter)?'active':''; ?>" onclick="filterSem('')">Overall</div>
+        <div class="tab <?php echo $semester_filter=='First Semester'?'active':''; ?>" onclick="filterSem('First Semester')">1st Semester</div>
+        <div class="tab <?php echo $semester_filter=='Second Semester'?'active':''; ?>" onclick="filterSem('Second Semester')">2nd Semester</div>
+    </div>
+    
+<?php
+    if($students && $students->num_rows > 0) {
+        while($st = $students->fetch_assoc()) {
+            $sid = $st['students_id'];
+            $name = trim($st['FirstName'].' '.($st['MI']?$st['MI'].'. ':'').$st['LastName']);
+            
+            $reg = $conn->query("SELECT * FROM registration r WHERE r.students_id = $sid" . buildWhereClause('r') . " ORDER BY registration_date DESC");
+            $fines = $conn->query("SELECT f.* FROM fines f LEFT JOIN registration r ON f.registration_no = r.registration_no WHERE f.students_id = $sid" . buildWhereClause('r'));
+            $payments = $conn->query("SELECT SUM(payment_amount) as paid FROM fines_payments WHERE students_id = $sid");
+            
+            $total_reg = 0; 
+            $total_fines = 0; 
+            $total_paid = 0;
+            
+            if($reg) { 
+                $reg->data_seek(0); 
+                while($r = $reg->fetch_assoc()) {
+                    if($r['payment_status']=='Paid') $total_reg += $r['amount']; 
+                }
+                $reg->data_seek(0); 
+            }
+            if($fines) { 
+                while($f = $fines->fetch_assoc()) $total_fines += $f['PenaltyAmount']; 
+            }
+            if($payments) { 
+                $p = $payments->fetch_assoc();
+                $total_paid = $p['paid'] ?? 0; 
+            }
+?>
+    <div class="section-header">
+        <h4><?php echo htmlspecialchars($name); ?> - <?php echo htmlspecialchars($sid); ?> | <?php echo htmlspecialchars($st['Course'].' '.$st['YearLevel'].' - '.$st['Section']); ?></h4>
+    </div>
+    <div class="summary-grid">
+        <div class="summary-card"><h4>Registration Paid</h4><div class="value">₱<?php echo number_format($total_reg,2); ?></div></div>
+        <div class="summary-card warning"><h4>Total Penalties</h4><div class="value">₱<?php echo number_format($total_fines,2); ?></div></div>
+        <div class="summary-card success"><h4>Fines Paid</h4><div class="value">₱<?php echo number_format($total_paid,2); ?></div></div>
+        <div class="summary-card danger"><h4>Balance</h4><div class="value">₱<?php echo number_format($total_fines-$total_paid,2); ?></div></div>
+    </div>
+<?php
+            if($reg && $reg->num_rows > 0) {
+?>
+    <table class="report-table">
+        <thead><tr><th>Reg No</th><th>Date</th><th>Semester</th><th>School Year</th><th>Amount</th><th>Type</th><th>Status</th></tr></thead>
+        <tbody>
+<?php
+                while($r = $reg->fetch_assoc()) {
+                    $status_class = $r['payment_status']=='Paid' ? 'paid' : 'unpaid';
+?>
+            <tr>
+                <td><strong><?php echo htmlspecialchars($r['registration_no']); ?></strong></td>
+                <td><?php echo date('M d, Y',strtotime($r['registration_date'])); ?></td>
+                <td><?php echo htmlspecialchars($r['semester']); ?></td>
+                <td><?php echo htmlspecialchars($r['school_year']); ?></td>
+                <td>₱<?php echo number_format($r['amount'],2); ?></td>
+                <td><?php echo htmlspecialchars($r['payment_type']); ?></td>
+                <td><span class="badge badge-<?php echo $status_class; ?>"><?php echo htmlspecialchars($r['payment_status']); ?></span></td>
+            </tr>
+<?php
+                }
+?>
+        </tbody>
+    </table>
+<?php
+            }
+?>
+    <hr class="divider">
+<?php
+        }
+    } else {
+?>
+    <div class="empty-state"><i class="fa fa-inbox"></i><h3>No Registered Students Found</h3><p>No registered students match your criteria</p></div>
+<?php
+    }
+}
+
+// ===================== SUMMARY OF PENALTIES =====================
+elseif ($report_type == 'summary_penalty') {
+    $where = "WHERE 1=1";
+    if(!empty($year_level_filter)) $where .= " AND sp.YearLevel = '".$conn->real_escape_string($year_level_filter)."'";
+    if(!empty($section_filter)) $where .= " AND sp.Section = '".$conn->real_escape_string($section_filter)."'";
+    
+    $sql = "SELECT sp.YearLevel, sp.Section, sp.students_id, CONCAT(sp.FirstName,' ',sp.LastName) as name,
+            COALESCE(SUM(f.PenaltyAmount),0) as total_penalty,
+            COALESCE((SELECT SUM(payment_amount) FROM fines_payments WHERE students_id = sp.students_id),0) as total_paid
+            FROM student_profile sp
+            INNER JOIN registration reg ON sp.students_id = reg.students_id
+            LEFT JOIN fines f ON sp.students_id = f.students_id
+            LEFT JOIN registration r ON f.registration_no = r.registration_no
+            $where" . buildWhereClause('r') . "
+            GROUP BY sp.students_id ORDER BY sp.YearLevel, sp.Section, sp.LastName";
+    $result = $conn->query($sql);
+    
+    $summary = [];
+    if($result) {
+        while($row = $result->fetch_assoc()) {
+            $key = $row['YearLevel'].'|'.$row['Section'];
+            if(!isset($summary[$key])) $summary[$key] = ['students'=>[], 'total_penalty'=>0, 'total_paid'=>0];
+            $summary[$key]['students'][] = $row;
+            $summary[$key]['total_penalty'] += $row['total_penalty'];
+            $summary[$key]['total_paid'] += $row['total_paid'];
+        }
+    }
+    
+    $filter_info = '';
+    if(!empty($semester_filter)) $filter_info .= $semester_filter.' • ';
+    if(!empty($school_year_filter)) $filter_info .= 'SY: '.$school_year_filter;
+    if(empty($filter_info)) $filter_info = 'Overall Records';
+?>
+    <div class="report-header">
+        <h3>Summary of Student Penalties</h3>
+        <p><?php echo $filter_info; ?></p>
+    </div>
+    
+    <div class="tabs">
+        <div class="tab <?php echo empty($semester_filter)?'active':''; ?>" onclick="filterSem('')">Overall</div>
+        <div class="tab <?php echo $semester_filter=='First Semester'?'active':''; ?>" onclick="filterSem('First Semester')">1st Semester</div>
+        <div class="tab <?php echo $semester_filter=='Second Semester'?'active':''; ?>" onclick="filterSem('Second Semester')">2nd Semester</div>
+    </div>
+    
+<?php
+    $grand_penalty = 0; 
+    $grand_paid = 0;
+    
+    foreach($summary as $key => $data) {
+        $parts = explode('|', $key);
+        $yl = $parts[0];
+        $sec = $parts[1];
+        $grand_penalty += $data['total_penalty'];
+        $grand_paid += $data['total_paid'];
+?>
+    <div class="section-header"><h4><?php echo htmlspecialchars($yl); ?> - <?php echo htmlspecialchars($sec); ?></h4></div>
+    <div class="summary-grid">
+        <div class="summary-card warning"><h4>Total Penalties</h4><div class="value">₱<?php echo number_format($data['total_penalty'],2); ?></div></div>
+        <div class="summary-card success"><h4>Total Paid</h4><div class="value">₱<?php echo number_format($data['total_paid'],2); ?></div></div>
+        <div class="summary-card danger"><h4>Unpaid</h4><div class="value">₱<?php echo number_format($data['total_penalty']-$data['total_paid'],2); ?></div></div>
+    </div>
+    <table class="report-table">
+        <thead><tr><th>Student ID</th><th>Name</th><th>Total Penalty</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead>
+        <tbody>
+<?php
+        foreach($data['students'] as $st) {
+            $bal = $st['total_penalty'] - $st['total_paid'];
+            $status_class = $bal <= 0 ? 'paid' : 'unpaid';
+            $status_text = $bal <= 0 ? 'Cleared' : 'Unpaid';
+?>
+            <tr>
+                <td><?php echo htmlspecialchars($st['students_id']); ?></td>
+                <td><?php echo htmlspecialchars($st['name']); ?></td>
+                <td>₱<?php echo number_format($st['total_penalty'],2); ?></td>
+                <td>₱<?php echo number_format($st['total_paid'],2); ?></td>
+                <td>₱<?php echo number_format($bal,2); ?></td>
+                <td><span class="badge badge-<?php echo $status_class; ?>"><?php echo $status_text; ?></span></td>
+            </tr>
+<?php
+        }
+?>
+        </tbody>
+    </table>
+<?php
+    }
+?>
+    <div class="section-header"><h4>Grand Total</h4></div>
+    <div class="summary-grid">
+        <div class="summary-card warning"><h4>Grand Penalties</h4><div class="value">₱<?php echo number_format($grand_penalty,2); ?></div></div>
+        <div class="summary-card success"><h4>Grand Paid</h4><div class="value">₱<?php echo number_format($grand_paid,2); ?></div></div>
+        <div class="summary-card danger"><h4>Grand Unpaid</h4><div class="value">₱<?php echo number_format($grand_penalty-$grand_paid,2); ?></div></div>
+    </div>
+<?php
+}
+
+// ===================== COLLECTION INCOME =====================
+elseif ($report_type == 'collection_income') {
+    $where = "WHERE r.payment_status = 'Paid'";
+    if(!empty($year_level_filter)) $where .= " AND sp.YearLevel = '".$conn->real_escape_string($year_level_filter)."'";
+    if(!empty($section_filter)) $where .= " AND sp.Section = '".$conn->real_escape_string($section_filter)."'";
+    
+    $sql = "SELECT sp.YearLevel, sp.Section, r.semester, r.school_year, COUNT(*) as count, SUM(r.amount) as total_amount
+            FROM registration r JOIN student_profile sp ON r.students_id = sp.students_id
+            $where" . buildWhereClause('r') . " GROUP BY sp.YearLevel, sp.Section, r.semester, r.school_year ORDER BY r.school_year DESC, sp.YearLevel";
+    $result = $conn->query($sql);
+    
+    $fines_res = $conn->query("SELECT COALESCE(SUM(payment_amount),0) as fines_income FROM fines_payments");
+    $fines_income = $fines_res ? $fines_res->fetch_assoc()['fines_income'] : 0;
+    
+    $grand_total = 0; 
+    $by_level = [];
+    if($result) {
+        while($row = $result->fetch_assoc()) { 
+            $by_level[$row['YearLevel']][] = $row; 
+            $grand_total += $row['total_amount']; 
+        }
+    }
+    
+    $filter_info = '';
+    if(!empty($semester_filter)) $filter_info .= $semester_filter.' • ';
+    if(!empty($school_year_filter)) $filter_info .= 'SY: '.$school_year_filter;
+    if(empty($filter_info)) $filter_info = 'Overall Records';
+?>
+    <div class="report-header">
+        <h3>Collection Income Report</h3>
+        <p><?php echo $filter_info; ?></p>
+    </div>
+    
+    <div class="tabs">
+        <div class="tab <?php echo empty($semester_filter)?'active':''; ?>" onclick="filterSem('')">Overall</div>
+        <div class="tab <?php echo $semester_filter=='First Semester'?'active':''; ?>" onclick="filterSem('First Semester')">1st Semester</div>
+        <div class="tab <?php echo $semester_filter=='Second Semester'?'active':''; ?>" onclick="filterSem('Second Semester')">2nd Semester</div>
+    </div>
+    
+    <div class="summary-grid">
+        <div class="summary-card success"><h4>Registration Income</h4><div class="value">₱<?php echo number_format($grand_total,2); ?></div></div>
+        <div class="summary-card warning"><h4>Fines Income</h4><div class="value">₱<?php echo number_format($fines_income,2); ?></div></div>
+        <div class="summary-card"><h4>Total Collection</h4><div class="value">₱<?php echo number_format($grand_total+$fines_income,2); ?></div></div>
+    </div>
+    
+    <table class="report-table">
+        <thead><tr><th>Year Level</th><th>Section</th><th>Semester</th><th>School Year</th><th>Count</th><th>Amount</th></tr></thead>
+        <tbody>
+<?php
+    foreach($by_level as $level => $rows) {
+        $level_total = 0;
+        foreach($rows as $row) {
+            $level_total += $row['total_amount'];
+?>
+            <tr>
+                <td><?php echo htmlspecialchars($row['YearLevel']); ?></td>
+                <td><?php echo htmlspecialchars($row['Section']); ?></td>
+                <td><?php echo htmlspecialchars($row['semester']); ?></td>
+                <td><?php echo htmlspecialchars($row['school_year']); ?></td>
+                <td><?php echo $row['count']; ?></td>
+                <td>₱<?php echo number_format($row['total_amount'],2); ?></td>
+            </tr>
+<?php
+        }
+?>
+            <tr class="total-row"><td colspan="5"><?php echo htmlspecialchars($level); ?> Subtotal</td><td>₱<?php echo number_format($level_total,2); ?></td></tr>
+<?php
+    }
+?>
+            <tr class="total-row" style="background:#0ea5e9 !important"><td colspan="5" style="color:#fff !important">GRAND TOTAL</td><td style="color:#fff !important">₱<?php echo number_format($grand_total,2); ?></td></tr>
+        </tbody>
+    </table>
+<?php
+}
+
+// ===================== ATTENDANCE REPORT =====================
+elseif ($report_type == 'attendance_report') {
+    $where = "WHERE 1=1";
+    if(!empty($year_level_filter)) $where .= " AND sp.YearLevel = '".$conn->real_escape_string($year_level_filter)."'";
+    if(!empty($section_filter)) $where .= " AND sp.Section = '".$conn->real_escape_string($section_filter)."'";
+    
+    $sql = "SELECT e.event_Name, e.event_Date, sp.YearLevel, sp.Section,
+            COUNT(CASE WHEN a.Status='Present' THEN 1 END) as present,
+            COUNT(CASE WHEN a.Status='Absent' THEN 1 END) as absent,
+            COUNT(CASE WHEN a.Status='Late' THEN 1 END) as late,
+            COUNT(*) as total
+            FROM attendance a
+            JOIN event e ON a.event_name = e.event_Name
+            JOIN student_profile sp ON a.students_id = sp.students_id
+            LEFT JOIN registration r ON a.registration_no = r.registration_no
+            $where" . buildWhereClause('r') . "
+            GROUP BY e.event_Name, sp.YearLevel, sp.Section ORDER BY e.event_Date DESC, sp.YearLevel";
+    $result = $conn->query($sql);
+    
+    $filter_info = '';
+    if(!empty($semester_filter)) $filter_info .= $semester_filter.' • ';
+    if(!empty($school_year_filter)) $filter_info .= 'SY: '.$school_year_filter;
+    if(empty($filter_info)) $filter_info = 'Overall Records';
+?>
+    <div class="report-header">
+        <h3>Attendance Report</h3>
+        <p><?php echo $filter_info; ?></p>
+    </div>
+    
+    <div class="tabs">
+        <div class="tab <?php echo empty($semester_filter)?'active':''; ?>" onclick="filterSem('')">Overall</div>
+        <div class="tab <?php echo $semester_filter=='First Semester'?'active':''; ?>" onclick="filterSem('First Semester')">1st Semester</div>
+        <div class="tab <?php echo $semester_filter=='Second Semester'?'active':''; ?>" onclick="filterSem('Second Semester')">2nd Semester</div>
+    </div>
+    
+<?php
+    if($result && $result->num_rows > 0) {
+?>
+    <table class="report-table">
+        <thead><tr><th>Event</th><th>Date</th><th>Year Level</th><th>Section</th><th>Present</th><th>Absent</th><th>Late</th><th>Total</th><th>Rate</th></tr></thead>
+        <tbody>
+<?php
+        while($row = $result->fetch_assoc()) {
+            $rate = $row['total'] > 0 ? round(($row['present']/$row['total'])*100,1) : 0;
+?>
+            <tr>
+                <td><?php echo htmlspecialchars($row['event_Name']); ?></td>
+                <td><?php echo date('M d, Y',strtotime($row['event_Date'])); ?></td>
+                <td><?php echo htmlspecialchars($row['YearLevel']); ?></td>
+                <td><?php echo htmlspecialchars($row['Section']); ?></td>
+                <td><span class="badge badge-paid"><?php echo $row['present']; ?></span></td>
+                <td><span class="badge badge-unpaid"><?php echo $row['absent']; ?></span></td>
+                <td><span class="badge badge-partial"><?php echo $row['late']; ?></span></td>
+                <td><?php echo $row['total']; ?></td>
+                <td><strong><?php echo $rate; ?>%</strong></td>
+            </tr>
+<?php
+        }
+?>
+        </tbody>
+    </table>
+<?php
+    } else {
+?>
+    <div class="empty-state"><i class="fa fa-calendar-check"></i><h3>No Attendance Records</h3></div>
+<?php
+    }
+}
+
+// ===================== REGISTRATION REPORT =====================
+elseif ($report_type == 'registration_report') {
+    $where = "WHERE 1=1";
+    if(!empty($year_level_filter)) $where .= " AND sp.YearLevel = '".$conn->real_escape_string($year_level_filter)."'";
+    if(!empty($section_filter)) $where .= " AND sp.Section = '".$conn->real_escape_string($section_filter)."'";
+    
+    $sql = "SELECT sp.YearLevel, sp.Section, r.semester, r.school_year, COUNT(*) as total,
+            SUM(CASE WHEN r.payment_status='Paid' THEN 1 ELSE 0 END) as paid,
+            SUM(CASE WHEN r.payment_status='Unpaid' THEN 1 ELSE 0 END) as unpaid,
+            SUM(r.amount) as total_amount
+            FROM registration r JOIN student_profile sp ON r.students_id = sp.students_id
+            $where" . buildWhereClause('r') . " GROUP BY sp.YearLevel, sp.Section, r.semester, r.school_year ORDER BY r.school_year DESC, sp.YearLevel";
+    $result = $conn->query($sql);
+    
+    $filter_info = '';
+    if(!empty($semester_filter)) $filter_info .= $semester_filter.' • ';
+    if(!empty($school_year_filter)) $filter_info .= 'SY: '.$school_year_filter;
+    if(empty($filter_info)) $filter_info = 'Overall Records';
+?>
+    <div class="report-header">
+        <h3>Registration Report</h3>
+        <p><?php echo $filter_info; ?></p>
+    </div>
+    
+    <div class="tabs">
+        <div class="tab <?php echo empty($semester_filter)?'active':''; ?>" onclick="filterSem('')">Overall</div>
+        <div class="tab <?php echo $semester_filter=='First Semester'?'active':''; ?>" onclick="filterSem('First Semester')">1st Semester</div>
+        <div class="tab <?php echo $semester_filter=='Second Semester'?'active':''; ?>" onclick="filterSem('Second Semester')">2nd Semester</div>
+    </div>
+    
+<?php
+    if($result && $result->num_rows > 0) {
+        $gt = 0; $gp = 0; $gu = 0;
+?>
+    <table class="report-table">
+        <thead><tr><th>Year Level</th><th>Section</th><th>Semester</th><th>School Year</th><th>Total</th><th>Paid</th><th>Unpaid</th><th>Amount</th></tr></thead>
+        <tbody>
+<?php
+        while($row = $result->fetch_assoc()) {
+            $gt += $row['total'];
+            $gp += $row['paid'];
+            $gu += $row['unpaid'];
+?>
+            <tr>
+                <td><?php echo htmlspecialchars($row['YearLevel']); ?></td>
+                <td><?php echo htmlspecialchars($row['Section']); ?></td>
+                <td><?php echo htmlspecialchars($row['semester']); ?></td>
+                <td><?php echo htmlspecialchars($row['school_year']); ?></td>
+                <td><strong><?php echo $row['total']; ?></strong></td>
+                <td><span class="badge badge-paid"><?php echo $row['paid']; ?></span></td>
+                <td><span class="badge badge-unpaid"><?php echo $row['unpaid']; ?></span></td>
+                <td>₱<?php echo number_format($row['total_amount'],2); ?></td>
+            </tr>
+<?php
+        }
+?>
+            <tr class="total-row"><td colspan="4">GRAND TOTAL</td><td><strong><?php echo $gt; ?></strong></td><td><?php echo $gp; ?></td><td><?php echo $gu; ?></td><td></td></tr>
+        </tbody>
+    </table>
+<?php
+    } else {
+?>
+    <div class="empty-state"><i class="fa fa-clipboard-list"></i><h3>No Registration Records</h3></div>
+<?php
+    }
+}
+
+// ===================== EVENTS REPORT =====================
+elseif ($report_type == 'events_report') {
+    $sql = "SELECT e.*, 
+            (SELECT COUNT(*) FROM attendance a WHERE a.event_name = e.event_Name AND a.Status='Present') as present,
+            (SELECT COUNT(*) FROM attendance a WHERE a.event_name = e.event_Name AND a.Status='Absent') as absent,
+            (SELECT COUNT(*) FROM attendance a WHERE a.event_name = e.event_Name) as total_att,
+            (SELECT COALESCE(SUM(PenaltyAmount),0) FROM fines f WHERE f.event_name = e.event_Name) as total_fines
+            FROM event e ORDER BY e.event_Date DESC";
+    $result = $conn->query($sql);
+?>
+    <div class="report-header">
+        <h3>Events Report</h3>
+        <p>Complete list of events with attendance and fines summary</p>
+    </div>
+    
+<?php
+    if($result && $result->num_rows > 0) {
+?>
+    <table class="report-table">
+        <thead><tr><th>Event Name</th><th>Date</th><th>Venue</th><th>Present</th><th>Absent</th><th>Total</th><th>Fines Generated</th></tr></thead>
+        <tbody>
+<?php
+        while($row = $result->fetch_assoc()) {
+?>
+            <tr>
+                <td><strong><?php echo htmlspecialchars($row['event_Name']); ?></strong></td>
+                <td><?php echo date('M d, Y',strtotime($row['event_Date'])); ?></td>
+                <td><?php echo htmlspecialchars($row['event_Venue'] ?? 'N/A'); ?></td>
+                <td><span class="badge badge-paid"><?php echo $row['present']; ?></span></td>
+                <td><span class="badge badge-unpaid"><?php echo $row['absent']; ?></span></td>
+                <td><?php echo $row['total_att']; ?></td>
+                <td>₱<?php echo number_format($row['total_fines'],2); ?></td>
+            </tr>
+<?php
+        }
+?>
+        </tbody>
+    </table>
+<?php
+    } else {
+?>
+    <div class="empty-state"><i class="fa fa-calendar"></i><h3>No Events Found</h3></div>
+<?php
+    }
+}
+?>
+    </div>
+</div>
+
+<script>
+const chartData = <?php echo json_encode($chart_data); ?>;
+const yearlyData = <?php echo json_encode($yearly_data); ?>;
+
+const colors = ['rgba(14,165,233,0.85)','rgba(16,185,129,0.85)','rgba(139,92,246,0.85)','rgba(245,158,11,0.85)','rgba(239,68,68,0.85)'];
+
+new Chart(document.getElementById('pieChart'), {
+    type: 'pie',
+    data: {
+        labels: ['Registration', 'Attendance', 'Events', 'Fines (₱)'],
+        datasets: [{ data: [chartData.registration, chartData.attendance, chartData.events, chartData.fines/100], backgroundColor: colors, borderWidth: 3, hoverOffset: 15 }]
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
+});
+
+new Chart(document.getElementById('paymentPie'), {
+    type: 'doughnut',
+    data: {
+        labels: ['Paid', 'Unpaid'],
+        datasets: [{ data: [chartData.paid, chartData.unpaid], backgroundColor: ['rgba(16,185,129,0.85)','rgba(239,68,68,0.85)'], borderWidth: 3, hoverOffset: 15 }]
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
+});
+
+new Chart(document.getElementById('barChart'), {
+    type: 'bar',
+    data: {
+        labels: ['1st Year', '2nd Year', '3rd Year', '4th Year'],
+        datasets: [{ label: 'Income (₱)', data: [yearlyData['1stYear']?.income||0, yearlyData['2ndYear']?.income||0, yearlyData['3rdYear']?.income||0, yearlyData['4thYear']?.income||0], backgroundColor: colors, borderRadius: 8 }]
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+});
+
+new Chart(document.getElementById('regBar'), {
+    type: 'bar',
+    data: {
+        labels: ['1st Year', '2nd Year', '3rd Year', '4th Year'],
+        datasets: [{ label: 'Registrations', data: [yearlyData['1stYear']?.reg_count||0, yearlyData['2ndYear']?.reg_count||0, yearlyData['3rdYear']?.reg_count||0, yearlyData['4thYear']?.reg_count||0], backgroundColor: colors.slice().reverse(), borderRadius: 8 }]
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+});
+
+// Load saved filters when page loads
+window.addEventListener('DOMContentLoaded', function() {
+    loadSavedFilters();
+});
+
+function loadSavedFilters() {
+    const urlParams = new URLSearchParams(window.location.search);
+    
+    // Load semester filter
+    const savedSemester = localStorage.getItem('reportSemesterFilter');
+    const semesterSelect = document.getElementById('semesterFilter');
+    
+    if (savedSemester && savedSemester !== 'all' && semesterSelect) {
+        if (!urlParams.has('semester')) {
+            semesterSelect.value = savedSemester;
+            if (semesterSelect.value && !window.location.search.includes('semester=')) {
+                urlParams.set('semester', savedSemester);
+                window.location.search = urlParams.toString();
+                return;
+            }
+        }
+    }
+    
+    // Load school year filter
+    const savedSchoolYear = localStorage.getItem('reportSchoolYearFilter');
+    const schoolYearSelect = document.getElementById('schoolYearFilter');
+    
+    if (savedSchoolYear && savedSchoolYear !== 'all' && schoolYearSelect) {
+        if (!urlParams.has('school_year')) {
+            schoolYearSelect.value = savedSchoolYear;
+            if (schoolYearSelect.value && !window.location.search.includes('school_year=')) {
+                urlParams.set('school_year', savedSchoolYear);
+                window.location.search = urlParams.toString();
+                return;
+            }
+        }
+    }
+}
+
+function saveSemesterFilter() {
+    const semesterValue = document.getElementById('semesterFilter').value;
+    if (semesterValue) {
+        localStorage.setItem('reportSemesterFilter', semesterValue);
+    } else {
+        localStorage.setItem('reportSemesterFilter', 'all');
+    }
+}
+
+function saveSchoolYearFilter() {
+    const schoolYearValue = document.getElementById('schoolYearFilter').value;
+    if (schoolYearValue) {
+        localStorage.setItem('reportSchoolYearFilter', schoolYearValue);
+    } else {
+        localStorage.setItem('reportSchoolYearFilter', 'all');
+    }
+}
+
+function clearFilters() {
+    localStorage.removeItem('reportSemesterFilter');
+    localStorage.removeItem('reportSchoolYearFilter');
+    window.location.href = 'reports.php';
+}
+
+function toggleFilters() {
+    document.getElementById('studentIdGroup').style.display = document.getElementById('reportType').value === 'individual_statement' ? 'block' : 'none';
+}
+
+function filterSem(sem) {
+    const url = new URL(window.location);
+    if(sem === '') {
+        url.searchParams.delete('semester');
+        localStorage.setItem('reportSemesterFilter', 'all');
+    } else {
+        url.searchParams.set('semester', sem);
+        localStorage.setItem('reportSemesterFilter', sem);
+    }
+    window.location = url;
+}
+
+function exportToCSV() {
+    const reportType = '<?php echo $report_type; ?>';
+    const semester = '<?php echo $semester_filter; ?>';
+    const schoolYear = '<?php echo $school_year_filter; ?>';
+    const yearLevel = '<?php echo $year_level_filter; ?>';
+    const section = '<?php echo $section_filter; ?>';
+    const studentId = '<?php echo $student_id_filter; ?>';
+    
+    let csvContent = '';
+    let filename = '';
+    
+    if (reportType === 'individual_statement') {
+        filename = 'Individual_Statement_Report.csv';
+        csvContent = 'Student ID,Student Name,Course,Year Level,Section,Reg No,Date,Semester,School Year,Amount,Payment Type,Status\n';
+        
+        document.querySelectorAll('.section-header').forEach((header, idx) => {
+            const headerText = header.querySelector('h4').textContent;
+            const parts = headerText.split(' - ');
+            const namePart = parts[0].trim();
+            const idPart = parts[1] ? parts[1].split('|')[0].trim() : '';
+            const coursePart = parts[1] ? parts[1].split('|')[1].trim() : '';
+            
+            const nextTable = header.nextElementSibling;
+            while(nextTable && nextTable.classList.contains('summary-grid')) {
+                nextTable = nextTable.nextElementSibling;
+            }
+            
+            if (nextTable && nextTable.tagName === 'TABLE') {
+                const rows = nextTable.querySelectorAll('tbody tr');
+                rows.forEach(row => {
+                    const cols = row.querySelectorAll('td');
+                    if (cols.length >= 7) {
+                        const courseInfo = coursePart.split(' - ');
+                        const course = courseInfo[0] ? courseInfo[0].split(' ')[0] : '';
+                        const yearLvl = courseInfo[0] ? courseInfo[0].split(' ')[1] : '';
+                        const sec = courseInfo[1] || '';
+                        
+                        csvContent += `"${idPart}","${namePart}","${course}","${yearLvl}","${sec}",`;
+                        csvContent += `"${cols[0].textContent.trim()}",`;
+                        csvContent += `"${cols[1].textContent.trim()}",`;
+                        csvContent += `"${cols[2].textContent.trim()}",`;
+                        csvContent += `"${cols[3].textContent.trim()}",`;
+                        csvContent += `"${cols[4].textContent.trim()}",`;
+                        csvContent += `"${cols[5].textContent.trim()}",`;
+                        csvContent += `"${cols[6].textContent.trim()}"\n`;
+                    }
+                });
+            }
+        });
+        
+    } else if (reportType === 'summary_penalty') {
+        filename = 'Summary_Penalties_Report.csv';
+        
+        // Create Excel-compatible HTML table with styling
+        let htmlContent = `
+        <html xmlns:x="urn:schemas-microsoft-com:office:excel">
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                .paid { background-color: #d1fae5; color: #065f46; font-weight: bold; }
+                .unpaid { background-color: #fee2e2; color: #991b1b; font-weight: bold; }
+                table { border-collapse: collapse; width: 100%; }
+                th { background-color: #0ea5e9; color: white; font-weight: bold; padding: 10px; border: 1px solid #ccc; }
+                td { padding: 8px; border: 1px solid #ccc; }
+            </style>
+        </head>
+        <body>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Year Level</th>
+                        <th>Section</th>
+                        <th>Student ID</th>
+                        <th>Name</th>
+                        <th>Total Penalty</th>
+                        <th>Paid</th>
+                        <th>Balance</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>`;
+        
+        document.querySelectorAll('.section-header').forEach(header => {
+            const headerText = header.querySelector('h4').textContent;
+            const parts = headerText.split(' - ');
+            const yearLvl = parts[0] ? parts[0].trim() : '';
+            const sec = parts[1] ? parts[1].trim() : '';
+            
+            if (yearLvl !== 'Grand Total') {
+                let nextElem = header.nextElementSibling;
+                while(nextElem && nextElem.classList.contains('summary-grid')) {
+                    nextElem = nextElem.nextElementSibling;
+                }
+                
+                if (nextElem && nextElem.tagName === 'TABLE') {
+                    const rows = nextElem.querySelectorAll('tbody tr');
+                    rows.forEach(row => {
+                        const cols = row.querySelectorAll('td');
+                        if (cols.length >= 6) {
+                            const status = cols[5].textContent.trim();
+                            const statusClass = status.toLowerCase().includes('cleared') || status.toLowerCase().includes('paid') ? 'paid' : 'unpaid';
+                            
+                            // Extract numeric values and format with peso sign
+                            let totalPenalty = cols[2].textContent.trim();
+                            let paidAmount = cols[3].textContent.trim();
+                            let balance = cols[4].textContent.trim();
+                            
+                            // Add peso sign if not already present
+                            if (!totalPenalty.includes('₱')) totalPenalty = '₱' + totalPenalty;
+                            if (!paidAmount.includes('₱')) paidAmount = '₱' + paidAmount;
+                            if (!balance.includes('₱')) balance = '₱' + balance;
+                            
+                            htmlContent += `<tr class="${statusClass}">`;
+                            htmlContent += `<td>${yearLvl}</td>`;
+                            htmlContent += `<td>${sec}</td>`;
+                            htmlContent += `<td>${cols[0].textContent.trim()}</td>`;
+                            htmlContent += `<td>${cols[1].textContent.trim()}</td>`;
+                            htmlContent += `<td>${totalPenalty}</td>`;
+                            htmlContent += `<td>${paidAmount}</td>`;
+                            htmlContent += `<td>${balance}</td>`;
+                            htmlContent += `<td>${cols[5].textContent.trim()}</td>`;
+                            htmlContent += `</tr>`;
+                        }
+                    });
+                }
+            }
+        });
+        
+        htmlContent += `
+                </tbody>
+            </table>
+        </body>
+        </html>`;
+        
+        // Create download as .xls file (Excel will recognize HTML with styles)
+        const blob = new Blob([htmlContent], { type: 'application/vnd.ms-excel' });
+        const link = document.createElement('a');
+        const url = URL.createObjectURL(blob);
+        
+        link.setAttribute('href', url);
+        link.setAttribute('download', filename.replace('.csv', '.xls'));
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        return; // Exit early for summary_penalty
+        
+    } else if (reportType === 'collection_income') {
+        filename = 'Collection_Income_Report.csv';
+        csvContent = 'Year Level,Section,Semester,School Year,Count,Amount\n';
+        
+        const rows = document.querySelectorAll('.report-table tbody tr');
+        rows.forEach(row => {
+            const cols = row.querySelectorAll('td');
+            if (cols.length >= 6) {
+                csvContent += `"${cols[0].textContent.trim()}",`;
+                csvContent += `"${cols[1].textContent.trim()}",`;
+                csvContent += `"${cols[2].textContent.trim()}",`;
+                csvContent += `"${cols[3].textContent.trim()}",`;
+                csvContent += `"${cols[4].textContent.trim()}",`;
+                csvContent += `"${cols[5].textContent.trim()}"\n`;
+            }
+        });
+        
+    } else if (reportType === 'attendance_report') {
+        filename = 'Attendance_Report.csv';
+        csvContent = 'Event,Date,Year Level,Section,Present,Absent,Late,Total,Rate\n';
+        
+        const rows = document.querySelectorAll('.report-table tbody tr');
+        rows.forEach(row => {
+            const cols = row.querySelectorAll('td');
+            if (cols.length >= 9) {
+                csvContent += `"${cols[0].textContent.trim()}",`;
+                csvContent += `"${cols[1].textContent.trim()}",`;
+                csvContent += `"${cols[2].textContent.trim()}",`;
+                csvContent += `"${cols[3].textContent.trim()}",`;
+                csvContent += `"${cols[4].textContent.trim()}",`;
+                csvContent += `"${cols[5].textContent.trim()}",`;
+                csvContent += `"${cols[6].textContent.trim()}",`;
+                csvContent += `"${cols[7].textContent.trim()}",`;
+                csvContent += `"${cols[8].textContent.trim()}"\n`;
+            }
+        });
+        
+    } else if (reportType === 'registration_report') {
+        filename = 'Registration_Report.csv';
+        csvContent = 'Year Level,Section,Semester,School Year,Total,Paid,Unpaid,Amount\n';
+        
+        const rows = document.querySelectorAll('.report-table tbody tr');
+        rows.forEach(row => {
+            const cols = row.querySelectorAll('td');
+            if (cols.length >= 8) {
+                csvContent += `"${cols[0].textContent.trim()}",`;
+                csvContent += `"${cols[1].textContent.trim()}",`;
+                csvContent += `"${cols[2].textContent.trim()}",`;
+                csvContent += `"${cols[3].textContent.trim()}",`;
+                csvContent += `"${cols[4].textContent.trim()}",`;
+                csvContent += `"${cols[5].textContent.trim()}",`;
+                csvContent += `"${cols[6].textContent.trim()}",`;
+                csvContent += `"${cols[7].textContent.trim()}"\n`;
+            }
+        });
+        
+    } else if (reportType === 'events_report') {
+        filename = 'Events_Report.csv';
+        csvContent = 'Event Name,Date,Venue,Present,Absent,Total,Fines Generated\n';
+        
+        const rows = document.querySelectorAll('.report-table tbody tr');
+        rows.forEach(row => {
+            const cols = row.querySelectorAll('td');
+            if (cols.length >= 7) {
+                csvContent += `"${cols[0].textContent.trim()}",`;
+                csvContent += `"${cols[1].textContent.trim()}",`;
+                csvContent += `"${cols[2].textContent.trim()}",`;
+                csvContent += `"${cols[3].textContent.trim()}",`;
+                csvContent += `"${cols[4].textContent.trim()}",`;
+                csvContent += `"${cols[5].textContent.trim()}",`;
+                csvContent += `"${cols[6].textContent.trim()}"\n`;
+            }
+        });
+    }
+    
+    // Create download
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    
+    link.setAttribute('href', url);
+    link.setAttribute('download', filename);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+toggleFilters();
+</script>
+</body>
+</html>
+<?php $conn->close(); ?>
